@@ -1,0 +1,403 @@
+# Discord AI game master
+
+A Discord bot that runs a text tabletop campaign in a channel. One LLM acts as the game master (GM): it reads campaign records, searches the rules and setting you imported, rolls dice through a tool, and saves changes to a SQLite database.
+
+There is no RPG engine. Characters, NPCs, items, locations, quests, scenes, buildings and events are all generic records (`kind`, `name`, `parent_id`, JSON `data`, GM-only notes). The model handles rules, combat, crafting, travel and so on by reading and changing those records through four tools: `read_records`, `search_reference`, `roll_dice` and `save_turn`. The application enforces campaign isolation, Discord identity, owner permissions, transactions, bounded inputs, optional owner-approved field constraints and spending limits. Whether a ruling follows the rules is the model's job, and the application does not check it.
+
+Design details are in [IMPLEMENTATION_SPEC.md](IMPLEMENTATION_SPEC.md). The GM instructions are in [src/prompts/gm.md](src/prompts/gm.md).
+
+## Requirements
+
+- Node.js **>= 22.13** (`engines` in package.json). Tested on Node 24.20 on Windows.
+- npm (comes with Node). `better-sqlite3` ships prebuilt binaries for common platforms, so a C++ toolchain is normally not needed.
+- A Discord account that can create applications, and a server where you can invite bots.
+- One of:
+  - an OpenAI API key (default model `gpt-6-luna` via the Responses API), or
+  - a local [Ollama](https://ollama.com) install with a model that supports tool calling.
+- A machine that stays on, with a persistent local disk for `DATA_DIR`.
+
+## Quick start: play locally in the terminal (no Discord)
+
+```sh
+npm ci
+npm run local                      # Lanternfall sample campaign, you are the owner
+npm run local -- --pack ashen-oaths --fresh   # different rules pack, wipe the local save
+```
+
+This uses the same engine, records, dice, budgets and owner tools as the bot, with replies printed to the terminal. It needs `OPENAI_API_KEY` (or `LLM_PROVIDER=ollama`) in your environment or `.env`. The save lives in `data/local/` and persists between runs. Type `help` for commands. Anything without a command word is a play action. Use `as bob` to act as another player. Press numbered buttons by typing the number.
+
+## 1. Create the Discord bot
+
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
+2. **General Information**: copy the **Application ID**. This is `DISCORD_APPLICATION_ID`, and it is also the `CLIENT_ID` in the invite URL below.
+3. **Bot** tab: click **Reset Token** and copy the token into `DISCORD_TOKEN`. Treat it like a password. If it leaks, reset it.
+4. **Privileged Gateway Intents**: leave all three off (Presence, Server Members, Message Content). The bot only uses the `Guilds` intent and slash commands. It never reads ordinary channel messages.
+5. You can turn off **Public Bot** if only you should be able to invite it.
+
+### Invite with minimum permissions
+
+Scopes: `bot applications.commands`
+
+Bot permissions:
+
+| Permission | Value | Why |
+|---|---|---|
+| View Channels | 1024 | See the campaign channel |
+| Send Messages | 2048 | Public notices, and public replies when an interaction token has expired |
+| Attach Files | 32768 | Long configuration drafts are sent as a `configuration-draft.md` attachment |
+| Send Messages in Threads | 274877906944 | Lets you run a campaign inside a thread |
+
+Total: `1024 + 2048 + 32768 + 274877906944 = 274877942784`
+
+```text
+https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot+applications.commands&permissions=274877942784
+```
+
+Replace `CLIENT_ID` with your Application ID and open the URL.
+
+Not needed:
+- **Embed Links**. Replies are plain message content.
+- **Read Message History**. Slash commands do not need it.
+- **Mention Everyone**. All mentions are disabled on every send and edit.
+
+**Do not grant Administrator.** The bot does not need it, and a leaked token would then control your whole server.
+
+If a channel has permission overrides, make sure the bot's role can still view and send there.
+
+## 2. Install and configure
+
+```sh
+npm ci
+cp .env.example .env        # Windows PowerShell: Copy-Item .env.example .env
+```
+
+Edit `.env`. Every variable is documented in [.env.example](.env.example). Values already set in the real environment take precedence over `.env`. Never commit `.env`. It is already in `.gitignore`.
+
+### Discord
+
+```env
+DISCORD_TOKEN=...               # Bot tab
+DISCORD_APPLICATION_ID=...      # General Information tab
+DISCORD_GUILD_ID=               # optional: your server ID, for instant command registration
+BOT_ADMIN_USER_IDS=             # optional: comma-separated user IDs allowed to run /rpg setup anywhere
+```
+
+To copy server or user IDs, turn on Developer Mode in Discord (User Settings → Advanced) and right-click.
+
+### Model provider: OpenAI (default)
+
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-6-luna
+OPENAI_REASONING_EFFORT=low
+OPENAI_INPUT_USD_PER_MILLION=0.10
+OPENAI_OUTPUT_USD_PER_MILLION=0.50
+```
+
+The two price variables drive all budget arithmetic. The defaults are the short-context `gpt-6-luna` rates that applied when this project was written. **Check OpenAI's pricing page and update them before you rely on the budget limits.** If they are set too low, the bot will underestimate spend. `OPENAI_BASE_URL` is optional and points the client at an OpenAI-compatible endpoint.
+
+### Model provider: Ollama (local)
+
+```env
+LLM_PROVIDER=ollama
+OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:8b
+OLLAMA_NUM_CTX=16384
+```
+
+Pull the model first (`ollama pull qwen3:8b`). It must support tool calling. Ollama uses the same tools, records and limits as OpenAI. Dollar budgets do not apply because local calls are recorded as $0, but the call, tool, token and timeout limits still apply. **Local models have not been tested against Luna's quality here.** Expect more malformed tool calls, more failed turns and weaker rulings, especially from small models.
+
+### Check the setup
+
+```sh
+npm run doctor
+```
+
+The doctor checks the Node version, configuration, that the data directory is writable, SQLite FTS5, migrations and `integrity_check`, the GM prompt file, whether the Discord settings are present (values are never printed), budget sanity, and the provider. The provider check is free: OpenAI retrieves the model, and Ollama lists pulled models. It also reports whether a running bot holds the instance lock. It exits with code 1 if any check fails.
+
+### Register the slash command
+
+```sh
+npm run register
+```
+
+- With `DISCORD_GUILD_ID` set, `/rpg` is registered to that one server and appears immediately. This is best for a private group and for testing.
+- With it blank, `/rpg` is registered globally and can take up to an hour to appear.
+
+Run this again after updating the bot if the command definitions changed. The command can only be used in server channels, not DMs.
+
+The database is created and migrated automatically when the bot or any script opens it. `npm run migrate` applies migrations explicitly and lists them.
+
+## 3. Run the bot
+
+Pick one:
+
+```sh
+# Foreground, straight from TypeScript (tsx). Ctrl+C stops it cleanly.
+npm run dev
+
+# Compiled
+npm run build
+npm start                  # node dist/src/index.js
+```
+
+**Docker Compose** (one container, named volume for `/app/data`):
+
+```sh
+docker compose -f deploy/docker-compose.yml up -d --build
+docker compose -f deploy/docker-compose.yml run --rm bot node dist/scripts/doctor.js
+docker compose -f deploy/docker-compose.yml run --rm bot node dist/scripts/register-commands.js
+docker compose -f deploy/docker-compose.yml exec bot node dist/scripts/backup.js
+```
+
+Compose reads `../.env`. To use Ollama on the host, uncomment the `OLLAMA_URL` / `extra_hosts` lines in [deploy/docker-compose.yml](deploy/docker-compose.yml).
+
+**systemd** (Linux, no container): see the install steps at the top of [deploy/rpg-bot.service](deploy/rpg-bot.service). The unit keeps data in `/var/lib/rpg-bot` and runs as a dedicated user.
+
+Operating notes:
+
+- **One process per data directory.** The bot takes a lock file (`DATA_DIR/rpg.lock`) and refuses to start if another live process holds it. Do not scale the container or run two copies against the same database.
+- **Persistent disk.** `DATA_DIR` holds the SQLite database, imported originals and backups. Do not put it on an ephemeral container filesystem or a network share.
+- **Keep the host awake.** On a laptop or desktop, turn off sleep and hibernate while the campaign is running, or the bot stops responding. On Windows, set Power & battery → Screen and sleep → "Never" for sleep while plugged in.
+- **Shutdown.** SIGINT/SIGTERM (Ctrl+C, `docker stop`, `systemctl stop`) stops accepting new requests and waits up to 30 seconds for active turns before closing. Anything left over is handled by recovery at the next start (see [Inspecting failures](#7-inspecting-failures)).
+- Logs go to stdout/stderr (`LOG_LEVEL=debug|info|warn|error`). Known secrets are redacted.
+
+## 4. Running a campaign
+
+### Sample material
+
+[sample-campaign/](sample-campaign/) contains two small original rules/setting/adventure packs. See [sample-campaign/README.md](sample-campaign/README.md).
+
+- `lanternfall/`: Lanternfall 1.0, a light d20 game in a flooded marsh country.
+- `ashen-oaths/`: Ashen Oaths, a 2d6 game with a harm track and shared supply instead of HP and coins.
+
+Both use the same code. Switching rules is a matter of what you import and approve.
+
+### Typical flow
+
+1. **Owner: `/rpg setup`** in the channel that will host the game. Options: `title`, `rules_edition` (for example `Lanternfall 1.0`), `premise`, `tone`, `max_players` (default 4), `boundaries`, `approve_characters`. You need **Manage Channels** in that channel, or your user ID must be in `BOT_ADMIN_USER_IDS`. Whoever runs setup becomes the campaign owner. One active campaign per channel. Different channels are fully separate campaigns.
+2. **Owner: `/rpg import`** with an `attachment` and a `role` (`rules`, `setting` or `adventure`). Accepted files are `.md`, `.txt`, and PDFs with a text layer, up to `MAX_IMPORT_MB`. You get a private preview with page and character counts and warnings, such as pages with no text layer, which are not imported. Click **Approve import** or **Reject**. The import stays private and unsearchable until approved. Adventure material is stored as GM-only. The original file is kept under `DATA_DIR/sources/` with its SHA-256, and identical re-imports are refused.
+   - After the **first** approval, while the campaign still has no rules digest, the bot automatically asks the model to draft a configuration: rules digest, setting summary, field conventions, character-creation procedure, optional constraints and a small starting situation. The draft appears privately for review, with an attached `.md` file if it is long. Click **Apply configuration** or **Discard**. This draft is a paid model call and counts against the budget.
+   - Importing the sample pack: import `rules.md` as rules, `setting.md` as setting, and `adventure.md` as adventure.
+   - Or seed a sample pack offline, with the bot stopped. This runs the same import, approval and record paths and applies the pack's reviewed `config.json` and `starting-records.json`:
+     `npm run seed-sample -- --guild <guild id> --channel <channel id> --owner <your user id> --pack lanternfall` (or `--pack ashen-oaths`). Add `--replace` to archive the campaign already in that channel first (its data is kept).
+3. **Owner: `/rpg configure text:...`** drafts any later change ("add a house rule: ...", "require owner approval for characters", "quantity must be a non-negative integer"). It shows a before/after preview, any new starting records, and questions the model has. Nothing changes until you click **Apply configuration**. A draft is refused if the configuration changed since it was drafted, or if existing records would violate a new constraint. Constraints are never applied by silently clamping values.
+4. **Players: `/rpg character text:...`** Character creation can take several exchanges. The model follows the campaign's creation rules and asks questions as needed. When it proposes a sheet, the player sees the proposed records with **Accept character** / **Discard** buttons. If the owner turned on character approval (`approve_characters` at setup, or through `/rpg configure`), accepting posts the draft in the channel with **Approve (owner)** / **Reject (owner)** buttons. The owner's own character skips this. The new character is always bound to the Discord user who made the draft. The model cannot choose that mapping. Each user gets one character per campaign, up to `max_players`.
+5. **Owner: `/rpg start`**. Players can create characters before or after this.
+6. **Play:** `/rpg play text:...` for any in-fiction action or speech. `/rpg ask` for rules or world questions that change nothing. `/rpg sheet` to see your sheet and inventory. `/rpg recap` for the story so far.
+
+Turns are processed one at a time per campaign, in order. Up to `MAX_QUEUED_TURNS_PER_CAMPAIGN` requests can wait. Beyond that, a request is refused with a private message. A play reply shows the action, the narration, and small receipts generated from the accepted dice and record changes (not from the narration).
+
+Confirmation buttons expire after `CONFIRMATION_TTL_MINUTES` (corrections, undo). Import, configuration and character drafts get 4× that, and owner approval of a character gets 8×. Each button works once, is checked again on click, and only works for the right user.
+
+### Command reference
+
+"Private" means an ephemeral reply only the caller sees.
+
+| Command | Who | Output | Model call? | What it does |
+|---|---|---|---|---|
+| `/rpg setup` | Manage Channels or `BOT_ADMIN_USER_IDS` | Private | No | Create a campaign in this channel; caller becomes owner |
+| `/rpg import` | Owner | Private | No (approval may trigger a config draft) | Upload rules/setting/adventure for review |
+| `/rpg configure` | Owner | Private | Yes | Draft a configuration change for review |
+| `/rpg start` / `pause` / `resume` | Owner | Private acknowledgement + public notice | No | Campaign lifecycle. `play` only works while active |
+| `/rpg character` | Any member without a character | Private (owner approval request is public) | Yes | Conversational character creation |
+| `/rpg play` | Players with a character | **Public** | Yes | Main game action |
+| `/rpg ask` | Anyone in the channel | Private | Yes | Read-only question. No dice, no writes, player-visible data only |
+| `/rpg sheet` | Players | Private | No | Your sheet and inventory from the database, without GM notes |
+| `/rpg recap` | Anyone in the channel | **Public** | Only if the cached recap is stale | Recap from saved events |
+| `/rpg gm` | Owner | Private preview; public announcement on apply | Yes | Correction, clarification or world advance |
+| `/rpg undo` | Owner | Private preview; public announcement on apply | No | Revert the latest world turn |
+| `/rpg usage` | Owner | Private | No | Spend, tokens, budget, recent failures |
+| `/rpg backup` | Owner | Private | No | Write a backup on the bot host |
+
+"Owner" means the campaign owner (the user who ran `/rpg setup`). `BOT_ADMIN_USER_IDS` only lets someone create campaigns. It does not give them owner rights over other people's campaigns.
+
+## 5. Owner tools
+
+### Corrections: `/rpg gm text:...`
+
+Use this for "Mira should have 7 HP, not 3", "the bridge collapsed overnight", "move the party to the inn" or "advance time to dawn". The model drafts record changes and a public announcement. You see a private preview with the diff (hidden/GM-only fields are marked 🔒), the stated reason and the announcement text, plus **Apply change** / **Cancel**.
+
+On apply, the change is written in one transaction as a `correction` turn. Only the announcement is posted publicly, and it is meant to contain no hidden facts. Check it in the preview, because the model writes it. The change is refused if the world changed after it was drafted (the campaign revision moved), so it cannot overwrite newer facts. Draft it again in that case. `/rpg gm` is also how you resolve a turn that is `needs_attention`.
+
+### Undo: `/rpg undo`
+
+This targets only the **latest** committed `play` or `correction` turn that has not already been reverted. The preview lists each field and what it reverts to. It is refused if any record it touched has changed since, so it cannot overwrite later changes. On apply, the original records are restored from stored before-images, and a new `undo` turn is recorded and announced publicly. The original turn, its dice and its cost stay in the log. Undo does not replay the action. Rolling back further than the latest turn is a backup/restore job.
+
+### Usage: `/rpg usage`
+
+Shows, for the current UTC calendar month: model calls, requests, input/output tokens, spend, money still held for in-flight or uncertain calls, the campaign budget and how much remains, the per-request ceiling, bot-wide spend (if `GLOBAL_MONTHLY_BUDGET_USD` is set), and the **five most recent failed turns** (`aborted` or `needs_attention`) with their error text.
+
+### Pause/resume: `/rpg pause`, `/rpg resume`
+
+While paused, `/rpg play` is refused. A `play` turn that was already queued is aborted with a notice and does not run. Other commands keep working.
+
+## 6. Budgets and limits
+
+All limits come from `.env`. Defaults are starting values, not performance promises.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_MODEL_CALLS_PER_TURN` | 8 | Model API requests one request may make (read → roll → save is often 2–4) |
+| `MAX_TOOL_CALLS_PER_TURN` | 24 | Tool calls across those requests |
+| `MAX_INPUT_TOKENS_PER_CALL` | 16000 | Estimated input size cap per call. The turn fails rather than send more |
+| `MAX_OUTPUT_TOKENS_PER_CALL` | 4096 | Output cap per call. Also used in the worst-case reservation |
+| `TURN_TIMEOUT_SECONDS` | 90 | Wall-clock limit for one request's model loop |
+| `CAMPAIGN_MONTHLY_BUDGET_USD` | 5 | Spend per campaign per UTC calendar month. `0` refuses all paid turns |
+| `MAX_TURN_COST_USD` | 0.02 | Ceiling for one player request (`play`, `ask`, `character`, `recap`, summaries) |
+| `MAX_ADMIN_TURN_COST_USD` | 0.05 | Ceiling for one owner request (`gm`, `configure`, including the post-import configuration draft) |
+| `GLOBAL_MONTHLY_BUDGET_USD` | 0 | Bot-wide monthly ceiling across all campaigns. `0` = no extra ceiling |
+| `MAX_CONCURRENT_MODEL_TURNS` | 2 | Model calls in flight across all campaigns |
+| `MAX_QUEUED_TURNS_PER_CAMPAIGN` | 5 | Queued + running requests per campaign before new ones are refused |
+| `MAX_IMPORT_MB` | 20 | Largest import file |
+| `CONFIRMATION_TTL_MINUTES` | 15 | Base lifetime of confirmation buttons (see above) |
+
+How spending is controlled (paid provider only):
+
+- **Before every model call** the bot reserves that call's worst-case cost: estimated input tokens × input price + `MAX_OUTPUT_TOKENS_PER_CALL` × output price. The reservation is written to the turn before the request is sent, so a crash still counts it. The call goes ahead only if all three checks pass: campaign month spend + held reservations + this call ≤ campaign budget; the same for the bot-wide budget (if set); and this request's own spend + this call ≤ the per-request ceiling.
+- After the call, the reservation is replaced by the actual cost from the reported token usage. If the call failed in a way that may still have been billed (timeout, connection loss, server error), the worst case is kept as spent. Outright rejections release it. Reservations still held when the process died are counted as spent at the next start.
+- Example with default prices: a full 16k-token input plus 4096 output tokens costs about $0.0016 + $0.0020 ≈ $0.0036, so `MAX_TURN_COST_USD=0.02` allows about five maximum-size calls. Smaller contexts reserve less.
+- **When a budget is exhausted, no new paid call starts.** This covers player turns, `/rpg ask`, character drafts, non-cached recaps, background history summaries, `/rpg gm` and `/rpg configure` drafts, the automatic configuration draft after an import, and resumed or retried turns. New requests are refused up front with a private message once the campaign's month is used up. A request that hits a ceiling partway through fails with "Nothing in the world changed".
+- **No automatic model or provider switching.** When the budget runs out, the bot stops making calls. Raise the budget in `.env` and restart, or wait for the next month.
+- These limits count only this bot's own calls under your configured prices. They do not see other applications using the same API key. Set a hard limit in your OpenAI account as well.
+
+## 7. Inspecting failures
+
+Start with `/rpg usage`. It lists the five most recent `aborted` / `needs_attention` turns and their errors. For more detail, open the database. Every request is a row in `turns`.
+
+### Turn statuses
+
+| Status | Meaning |
+|---|---|
+| `queued` | Accepted, waiting for its campaign's queue |
+| `running` | Model loop in progress |
+| `committed` | World change (or read-only answer) saved; reply not yet fully delivered |
+| `delivered` | Reply sent (or a private reply could no longer be sent; see `delivery_json`) |
+| `aborted` | Failed or refused before commit (budget, queue full, model error, paused). Nothing in the world changed |
+| `needs_attention` | The owner needs to act. Either a play turn failed after dice were rolled, a turn was interrupted twice, or delivery failed 10 times |
+
+Draft and confirmation rows also use `proposed`, `awaiting_owner`, `confirmed`, `rejected`, `expired` and `superseded`.
+
+### What happens on failure and at restart
+
+- A model error or timeout **before commit** changes no records. Dice already rolled stay in `rolls_json`. A `play` or `gm` turn that rolled dice is retried **once** with the same saved checks. If it fails again, a play turn becomes `needs_attention` and the player is told the dice are kept and the owner will resolve it with `/rpg gm`. The bot never silently re-runs an action with fresh dice.
+- **After commit**, a delivery failure only resends the stored reply. The action is never run again. Undelivered committed turns are retried at startup and every 30 seconds. After 10 failed attempts the turn becomes `needs_attention`.
+- **At startup**, recovery: counts any reservations left by `running` turns as spent; puts interrupted turns back in the queue once (they resume with their saved checks); marks turns interrupted a second time as `needs_attention` and posts a notice; aborts interrupted imports and undos; expires stale drafts; re-runs `queued` turns; and retries undelivered replies.
+
+### Useful columns
+
+- `status`, `error`: outcome and reason.
+- `mode`: `play`, `ask`, `recap`, `character`, `gm`, `correction`, `undo`, `configure`, `import`, `lifecycle`, `summary`.
+- `input_text`: what the player or owner typed.
+- `tool_log_json`: each model call's tool calls with arguments and outputs, plus final text and provider errors (the last 80 entries, clipped).
+- `rolls_json`: declared checks and their results.
+- `changes_json`, `before_images_json`: accepted operations and diffs, and the record states used by undo.
+- `public_reply`, `gm_note`: the stored narration and the model's short ruling note.
+- `usage_json`: `calls`, `input_tokens`, `output_tokens`, `cost_usd`, `reserved_usd`, `provider`, `model`.
+- `delivery_json`: target channel, sent `message_ids`, `attempts`, `last_error`, `delivered_at`.
+
+### Example queries
+
+The `sqlite3` command-line tool is not bundled. Install it separately, or use any SQLite browser. Open the database read-only while the bot runs:
+
+```sh
+sqlite3 -readonly data/rpg.sqlite
+```
+
+```sql
+-- Recent problems in all campaigns
+SELECT id, campaign_id, mode, status, error, created_at
+FROM turns WHERE status IN ('aborted', 'needs_attention')
+ORDER BY id DESC LIMIT 20;
+
+-- What the model did on one turn
+SELECT input_text, tool_log_json, rolls_json, gm_note FROM turns WHERE id = 123;
+
+-- Replies stuck in delivery
+SELECT id, json_extract(delivery_json, '$.attempts') AS attempts,
+       json_extract(delivery_json, '$.last_error') AS last_error
+FROM turns WHERE status = 'committed';
+
+-- Most expensive requests this month
+SELECT id, mode, json_extract(usage_json, '$.calls') AS calls,
+       json_extract(usage_json, '$.cost_usd') AS cost
+FROM turns WHERE created_at >= strftime('%Y-%m-01', 'now')
+ORDER BY cost DESC LIMIT 10;
+```
+
+Do not edit the database by hand while the bot runs. Use `/rpg gm` for world corrections.
+
+## 8. Backup and restore
+
+**Create a backup** with `/rpg backup` (owner, private reply with the ID) or from the host:
+
+```sh
+npm run backup
+```
+
+This writes `DATA_DIR/backups/<id>/` containing `rpg.sqlite`, made with SQLite's online backup API (safe while the bot runs), the imported source originals, and `manifest.json` with checksums, schema version and table counts. The backup copy passes `integrity_check` before it is reported. `.env`, the Discord token and API keys are never included. A backup contains **all** campaigns in the database, including GM secrets, so do not post it in a game channel. Copy backups off the machine yourself. Nothing is uploaded anywhere.
+
+**Test a restore** into a separate directory without touching live data. This works while the bot is running:
+
+```sh
+npm run restore -- <backupId> --target-dir ./restore-test
+```
+
+It verifies the database and source checksums, `integrity_check` and table counts. You can point `npm run doctor` at the result with `DATA_DIR=./restore-test`. Use `--force` to overwrite an existing `rpg.sqlite` in the target directory.
+
+**Live restore** requires the bot to be stopped. The script refuses while a running process holds the instance lock.
+
+```sh
+# stop the bot first
+npm run restore -- <backupId>
+# then start the bot again
+```
+
+Before overwriting anything, the current database (including `-wal`/`-shm`) and `sources/` are moved to `DATA_DIR/pre-restore-<timestamp>/`. `--force` skips that safety copy. `<backupId>` can also be a path to a backup directory. Newer migrations are applied when the bot next opens the database.
+
+## 9. Tests and evaluations
+
+```sh
+npm test            # deterministic vitest suite: no network, no Discord, no model, no cost
+npm run typecheck
+```
+
+```sh
+npm run eval                 # full run: 3-player Lanternfall session (30+ turns) + Ashen Oaths pack switch
+npm run eval -- --quick      # shorter 2-player Lanternfall session
+EVAL_BUDGET_USD=1 npm run eval -- --quick
+```
+
+The runner drives the real turn runner, tools, records and provider in a temporary data directory. A capturing port stands in for Discord, so it does not exercise Discord itself. It covers AI character creation, NPC dialogue and memory, a rules question, a false claim, instruction injection, attempts to get hidden information, purchase, transfer, consumption, crafting, travel, construction, an owner world-advance, combat with spells, a mid-session restart, rest, quest progress, recap and cached recap, a correction, undo, and a backup restored into a clean instance. Its automated checks are storage-level only (did HP change, did an item move, did membership stay unchanged, did any GM-note text appear verbatim in a public reply).
+
+`npm run eval` calls the configured model for real and **costs money** on a paid provider. Its total spend is capped by `EVAL_BUDGET_USD`. Reports are written to `evals/reports/`, which is git-ignored. Passing scenarios do not prove the rulings are correct. A person needs to read the transcripts and judge rule fidelity, narrative consistency and secret handling. Treat the model's own judgement as one input at most.
+
+## Test status
+
+Last updated 2026-10-22 on Windows 11, Node 24.20.0. Only the runs listed here actually happened.
+
+**Deterministic suite (`npm test`): 163/163 passed in 11 files.** `npm run typecheck` and `npm run build` are clean. The suite covers every item in spec §14's deterministic list: replay idempotency; full rollback on failed validation; serialized concurrent turns; no identity, role, budget or source changes from the model; campaign isolation; dice reuse after retry and restart; cycles, dangling references, bad numbers and constraints; read-only ask and sheet; delivery retry without rerunning the action; undo and correction audit trails with no overwrite; budget stops, including configure/summary work; secret filtering in views, context and backups; backup restored into a clean instance; and PDF/text extraction gaps with no code execution.
+
+**Startup:** `npm run doctor` passed (3 warnings: no Discord token or app ID on this machine). `node dist/src/index.js` reached Discord login and stopped cleanly on an invalid token, releasing its lock.
+
+**Live model, GPT-6 Luna (reasoning `low`), `npm run eval` full run:** 32/34 checks passed. 3 players over 42 turns plus a 4-turn Ashen Oaths pack switch, 118 model calls, **$0.10**. No turn failed or needed owner attention. The two failed checks are model-ruling disagreements, not storage or security bugs:
+- *Construction:* the GM narrated a barricade across the door but stored it only in the scene's text, not as its own record. This is a persistence miss to watch.
+- *Spell:* the GM refused, correctly, because the character knew no attack spell and it was not her turn in the stored initiative. The automated check expected a cast.
+Earlier quick runs, which I used to fix prompts, cost about $0.15 in total. They exposed a one-tool-call-per-response pattern and an input-token overestimate, both fixed.
+
+**Live model, Ollama `qwen3.5:4b`, `npm run eval -- --quick`:** 19/29 checks passed, $0. The adapter worked end to end (tool calls, character creation, crafting, transfer, recap, undo, backup). The 4B model ran out of the 8-call limit on 9 turns. Those turns changed nothing and were reported to the player. A small local model is not a substitute for Luna at these limits.
+
+**Not done:** the bot has **not** been run in a live Discord server or with real players. No Discord token was available. Discord behavior is covered only by unit tests with a faked REST client. Transcripts in `evals/reports/` have not had a full human review of rule fidelity.
+
+## Limitations
+
+- **The model is the GM, and it makes mistakes.** It can misapply rules, forget to save a consequence, narrate something that does not match the saved records, or rule inconsistently. The receipts under each play reply are built from what was actually saved, so check them against the narration. Use `/rpg gm` or `/rpg undo` to fix things.
+- **Secrets can leak through narration.** GM notes and GM-only records are kept out of sheets, recaps and `/rpg ask` context in code. The GM model can still read them during play and may reveal them in prose. Filtering reduces this risk but cannot rule it out.
+- **Constraints catch malformed bookkeeping, not unfair outcomes.** Optional constraints (required, integer, min/max, enum, immutable, field comparisons) reject bad data. They cannot tell whether loot or a reward was deserved. If the model can legitimately create an item, it can also create one by mistake.
+- **Retrieval can miss things.** `search_reference` is full-text search over imported sections. A relevant clause may not be found, and the model then makes a provisional ruling.
+- **Imports:** no OCR. Scanned or image-only PDF pages are reported and skipped. Tables and stat blocks in PDFs often extract badly, so review the import preview and correct the digest through `/rpg configure`. Only Markdown, plain text and text-layer PDFs are accepted.
+- **One process, one machine.** No clustering or replicas. If the host sleeps or goes offline, the bot is offline.
+- **Discord delivery is at-least-once, not exactly-once.** World changes are idempotent per request. Retried channel posts use a message nonce with `enforce_nonce` so Discord can drop duplicates, but a duplicate or missing message is still possible in rare network failures.
+- **Private replies can be lost.** Ephemeral replies (`ask`, `character`, owner previews) can only be sent through the interaction token, which Discord expires after 15 minutes. If a private reply is not ready in time (a long queue, or a restart), it is dropped and recorded in `delivery_json`. Public replies fall back to a normal channel message.
+- **Live Discord use:** unless [Test status](#test-status) says otherwise, this bot has not been run in a live Discord server with real players.

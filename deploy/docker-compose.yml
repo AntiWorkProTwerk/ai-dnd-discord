@@ -1,0 +1,36 @@
+# Usage (from the repository root):
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml run --rm bot node dist/scripts/doctor.js
+#   docker compose -f deploy/docker-compose.yml run --rm bot node dist/scripts/register-commands.js
+#   docker compose -f deploy/docker-compose.yml exec bot node dist/scripts/backup.js
+#
+# Exactly ONE replica: SQLite lives on the data volume and the bot holds a single-instance lock.
+# Do not scale this service or run a second copy against the same volume.
+name: rpg-bot
+
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: rpg-bot:latest
+    env_file:
+      - ../.env
+    environment:
+      DATA_DIR: /app/data
+      # When using a host Ollama with LLM_PROVIDER=ollama:
+      # OLLAMA_URL: http://host.docker.internal:11434
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    volumes:
+      - rpg-data:/app/data
+      # Or bind-mount a host directory instead (must be writable by uid 1000, the "node" user):
+      # - ../data:/app/data
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+
+volumes:
+  rpg-data:

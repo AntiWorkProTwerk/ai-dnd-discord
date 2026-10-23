@@ -1,0 +1,13 @@
+# Used automatically by BuildKit for deploy/Dockerfile (context = repository root).
+# Keep secrets and live data out of the image.
+.env
+.env.*
+!.env.example
+data
+**/data
+dist
+node_modules
+coverage
+evals/reports
+*.log
+.git

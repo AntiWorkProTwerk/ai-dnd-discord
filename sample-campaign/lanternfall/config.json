@@ -1,0 +1,120 @@
+{
+  "config_version": 1,
+  "title": "Lanternfall: The Silent Bell",
+  "premise": "In the flooding marsh country of the Fenreach, the flood-bell at Cray's Chapel has gone silent as the water rises. A lantern-keeper hires the characters to find out why and ring it, and the trail leads to smugglers and a corrupt Reeve.",
+  "rules_edition": "Lanternfall 1.0",
+  "tone": "Moody, rain-soaked low fantasy with warmth and wry humor; small-town intrigue over world-ending stakes. Danger is real but fair.",
+  "max_players": 4,
+  "boundaries": "No sexual content. No graphic torture or harm to children. Violence is described briefly, not lingered on. Players can ask to fade to black at any time.",
+  "require_character_approval": false,
+  "rules_digest": "CHECKS: roll 1d20 + ability modifier (+ training bonus if trained) and succeed if total >= DC. DCs: easy 8, moderate 12, hard 15, very hard 18, nearly impossible 22. Advantage = 2d20kh1, disadvantage = 2d20kl1; they cancel and never stack. Opposed checks: higher total wins, defender wins ties. Group checks succeed if at least half succeed. Only roll when failure is interesting.\nABILITIES: str, dex, con, int, wis, cha scored 3-18; modifier = floor((score - 10) / 2). Training bonus +2 at levels 1-3, +3 at levels 4-5.\nCOMBAT: initiative 1d20 + DEX modifier, rolled once per fight, highest first (ties: higher DEX, then PCs). Round = 6 s. Each turn: move 9 m (half in water or mud) plus one action: Attack, Cast, Dash, Dodge, Help, Use item, or Ready. Attack: 1d20 + STR (melee) or DEX (ranged/light) + training if trained; hit if total >= target AC; damage = weapon die + same modifier. Natural 20 = crit (damage dice twice); natural 1 always misses. Unseen targets or long range = disadvantage; melee vs prone/restrained/unaware = advantage.\nHP AND DYING: HP never goes below 0. A single hit equal to max HP kills. At 0 HP add conditions \"dying\" and \"prone\"; each turn roll a last breath check, 1d20 with no modifier: 10+ success, 9- failure; 3 successes = stable (replace \"dying\" with \"unconscious\"), 3 failures = death; natural 20 = up at 1 HP; natural 1 = two failures; damage while dying = one failure. Any healing ends dying. Stabilize ally: action, DC 10 medicine. Stable creatures wake at 1 HP after 1d4 hours.\nCONDITIONS: blinded, charmed, dying, exhausted, frightened, grappled, poisoned, prone, restrained, soaked (-1 AC, spells cost +1 charge until dried), unconscious.\nLANTERN MAGIC: casters spend charges from a wardlantern (data.lantern.charges, never below 0 or above max), then roll 1d20 + WIS + training vs the spell DC (attack spells roll vs AC). On failure the charges are still spent and the caster rolls 1d6 backlash: 1 lose another charge, 2 take 1d6 damage, 3 blinded until end of next turn, 4 poisoned 10 rounds, 5 hostiles within 30 m locate the caster, 6 spell hits a random nearby target. Spells (cost/DC): Kindle 0/8, Searing Mote 1/vs AC 2d6 fire, Mend Flesh 1/10 heal 1d8+WIS, Veil of Dusk 1/12, Lantern Ward 1/12 +2 AC, Reveal 1/12, Binding Glare 2/14 (DC 13 WIS or restrained), Lightburst 2/14 3d6 fire in 5 m (DC 13 DEX half), Calm the Water 2/15. Charges: all back on a long rest; a glimmer vial restores 1 (action).\nREST AND TIME: short rest 1 hour, regain 1d6 + CON HP, max twice per day. Long rest 8 hours: all HP and charges, remove exhausted, one per 24 hours; unsheltered in the wet season needs DC 10 CON or wake exhausted. Track scene time as day plus dawn/morning/midday/afternoon/dusk/night.\nTRAVEL: causeway 4 km/h (24 km/day), open bog half, punt 6 km/h. One ration per traveler per day. Guide makes DC 12 survival (15 at night or in storms); failure = lost half day or trouble. Forced march past 8 hours: DC 12 CON per hour or exhausted.\nCRAFTING: materials worth half the price, tools, one day per 10 gp of price (min 1 hour). Check 1d20 + INT (+ training) vs DC 10 simple / 13 skilled / 16 masterwork. Failure wastes half the materials; natural 1 wastes all of them.\nTRADE: sell at half list price (full price for trade goods). One DC 13 CHA haggle per merchant per day for 10 percent; failing by 5+ annoys them. 1 gp = 10 sp. Track coins exactly.\nADVANCEMENT: xp for objectives and clever play, not only kills (minor 25, notable 50, quest 100-200). Levels at 300 / 900 / 2000 / 4000 xp; cap level 5. On level up: archetype HP, +1 max charges for casters, new spells, +1 ability at levels 3 and 5.",
+  "setting_summary": "The Fenreach is a slowly flooding marsh valley where glowing stones fell forty-one years ago (the Lanternfall). Their residue, glimmer, fuels lantern magic. Wickmere is a stilt town of about 900 behind the clay Ringdike, with the Tallow and Tide inn, the Lamp House, the Reeve's Hall and toll chain, and the floating Pike Market. Cray's Chapel, three hours east, holds the flood-bell. Factions: the Lamp Circle (Keeper Odile Fenn), the Ferrymen's Guild (Brannoc Vell), the Reeve's Watch (Reeve Hask Morrow), and the rumored Hollow Oar smugglers. Coins: mark (gp) and bit (sp), 10 sp = 1 gp. Months of 30 days; play starts at dusk on 14 Rainmonth, in the stormy season.",
+  "conventions": "character / npc data: archetype; level; xp; abilities {str, dex, con, int, wis, cha} (scores); hp {current, max}; ac; training_bonus; trained [strings]; conditions [lowercase strings]; coins {gp, sp} (integers); casters also lantern {charges, max} and spells [names]; while dying last_breath {successes, failures}. NPCs may add attacks [strings] and attitude.\nitem data: quantity (integer >= 0), description, and as needed damage, armor, price (string like \"12 gp\"), charges, uses. Inventory = items whose parent is the holder; never a list on the character.\nlocation data: description; exits [{to_id, label}].\nscene data: status (\"active\" | \"ended\"); participants_ids [ids]; initiative [{id, value}] highest first; turn_of_id; round (0 outside combat); time (e.g. \"Day 1 (14 Rainmonth), dusk\"); pending_decision.\nquest data: status (\"open\" | \"completed\" | \"failed\"); objectives [strings]; giver_id; reward.\nevent data: due (in-world time), description. faction/relationship data: attitude, notes.",
+  "character_creation": "Follow the Lanternfall Character Creation steps: (1) name and one-line concept; (2) abilities by 4d6dl1 six times assigned freely, or the standard array 15, 14, 13, 12, 10, 8; (3) choose an archetype (Warden, Scout, Lamplighter, Mender) and apply its +1 ability, training, feature, and kit; (4) max HP from the archetype (Warden 12, Scout 9, Lamplighter 7, Mender 9, each + CON modifier), current = max; (5) AC = 10 + DEX modifier + armor (+1 shield); (6) roll 2d6 gp starting coins, sp 0, and optionally buy from the equipment list; (7) a goal, a fear, and one local tie. Start at level 1 with 0 xp and training_bonus 2. Create kit items as child item records of the character. Casters start with lantern charges at max (Lamplighter 3, Mender 2).",
+  "house_rules": [
+    "Generous healing draughts: drinking a healing draught as your action restores the maximum (10 HP) instead of rolling 2d4 + 2.",
+    "Inspiration: once per session, a player who plays their fear or goal in an interesting way may reroll one d20 and keep either result."
+  ],
+  "precedence": [
+    "house_rules",
+    "rules",
+    "adventure",
+    "setting"
+  ],
+  "provisional_ruling_policy": "When no source covers a situation, make a fair ruling consistent with similar Lanternfall rules (compare DCs, prices, and crafting times to the tables), label it \"provisional ruling\" in the narration, and record it in gm_note so the owner can confirm or correct it.",
+  "starting_situation": "Dusk on 14 Rainmonth at the Tallow and Tide inn in Wickmere, in a rainstorm. The room is full of flooded-out farmers talking about the flood-bell at Cray's Chapel, which has not rung for three nights. Keeper Odile Fenn of the Lamp Circle invites the characters to her table and offers 10 gp each now and 30 gp each plus a glimmer vial when the bell rings. Innkeeper Marrow Gale is serving; Reeve Hask Morrow will arrive later in the scene.",
+  "constraints": [
+    {
+      "kind": "item",
+      "path": "quantity",
+      "rule": "integer",
+      "value": null
+    },
+    {
+      "kind": "item",
+      "path": "quantity",
+      "rule": "min",
+      "value": 0
+    },
+    {
+      "kind": "character",
+      "path": "hp.current",
+      "rule": "lte_field",
+      "value": "hp.max"
+    },
+    {
+      "kind": "npc",
+      "path": "hp.current",
+      "rule": "lte_field",
+      "value": "hp.max"
+    },
+    {
+      "kind": "character",
+      "path": "coins.gp",
+      "rule": "integer",
+      "value": null
+    },
+    {
+      "kind": "character",
+      "path": "coins.gp",
+      "rule": "min",
+      "value": 0
+    },
+    {
+      "kind": "character",
+      "path": "coins.sp",
+      "rule": "integer",
+      "value": null
+    },
+    {
+      "kind": "character",
+      "path": "coins.sp",
+      "rule": "min",
+      "value": 0
+    },
+    {
+      "kind": "character",
+      "path": "lantern.charges",
+      "rule": "integer",
+      "value": null
+    },
+    {
+      "kind": "character",
+      "path": "lantern.charges",
+      "rule": "min",
+      "value": 0
+    },
+    {
+      "kind": "character",
+      "path": "lantern.charges",
+      "rule": "lte_field",
+      "value": "lantern.max"
+    },
+    {
+      "kind": "quest",
+      "path": "status",
+      "rule": "enum",
+      "value": [
+        "open",
+        "completed",
+        "failed"
+      ]
+    },
+    {
+      "kind": "scene",
+      "path": "status",
+      "rule": "enum",
+      "value": [
+        "active",
+        "ended"
+      ]
+    }
+  ],
+  "model": {
+    "reasoning_effort": null
+  },
+  "budget": {
+    "monthly_usd": null,
+    "max_turn_usd": null
+  }
+}

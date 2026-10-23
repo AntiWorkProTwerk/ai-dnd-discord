@@ -1,0 +1,47 @@
+# Example systemd unit for running the bot directly on a Linux host (no container).
+#
+# Install:
+#   sudo useradd --system --home /opt/rpg-bot --shell /usr/sbin/nologin rpgbot
+#   sudo git clone <repo> /opt/rpg-bot && cd /opt/rpg-bot
+#   sudo npm ci && sudo npm run build && sudo npm prune --omit=dev
+#   sudo cp .env.example /opt/rpg-bot/.env && sudo chmod 600 /opt/rpg-bot/.env   # then edit it
+#   sudo mkdir -p /var/lib/rpg-bot && sudo chown rpgbot:rpgbot /var/lib/rpg-bot
+#   sudo chown root:rpgbot /opt/rpg-bot/.env && sudo chmod 640 /opt/rpg-bot/.env
+#   sudo cp deploy/rpg-bot.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now rpg-bot
+#   journalctl -u rpg-bot -f
+#
+# Run only this one instance per data directory; the bot also enforces a lock file.
+
+[Unit]
+Description=Discord AI game master bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rpgbot
+Group=rpgbot
+WorkingDirectory=/opt/rpg-bot
+EnvironmentFile=/opt/rpg-bot/.env
+Environment=NODE_ENV=production
+# Persistent data outside the code checkout (overrides DATA_DIR from .env).
+Environment=DATA_DIR=/var/lib/rpg-bot
+# Optional: refuse to start unless the doctor passes (note: it makes a free provider call).
+#ExecStartPre=/usr/bin/node dist/scripts/doctor.js
+ExecStart=/usr/bin/node dist/src/index.js
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=60
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rpg-bot
+
+[Install]
+WantedBy=multi-user.target
