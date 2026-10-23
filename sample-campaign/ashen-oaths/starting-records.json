@@ -57,7 +57,7 @@
     "visibility": "public",
     "path": null,
     "value_json": null,
-    "data_json": "{\"status\":\"active\",\"participants_ids\":[\"$thane\",\"$wenna\"],\"initiative\":[],\"turn_of_id\":null,\"round\":0,\"time\":\"Day 12 of Frost, dusk\",\"pending_decision\":\"Thane Ysolde Kett asks the newly arrived Sworn to swear an oath to bring her son Edric home from Varrow Kiln.\"}",
+    "data_json": "{\"status\":\"active\",\"participants_ids\":[\"$thane\",\"$wenna\"],\"initiative\":[],\"turn_of_id\":null,\"round\":0,\"time\":\"Day 12 of Frost, dusk\",\"pending_decision\":\"Thane Ysolde Kett asks the newly arrived Sworn to swear an oath to bring her son Edric home from Varrow Kiln.\",\"main\":true,\"time_min\":1080}",
     "gm_notes_json": null,
     "expected_json": null,
     "expected_version": null,

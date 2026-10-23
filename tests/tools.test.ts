@@ -259,25 +259,36 @@ describe('save_turn', () => {
     expect(data(db, $pc!).gold).toBe(6);
   });
 
-  it('rejects a stale expected_revision without applying anything', () => {
+  it('play turns in parallel storylines are checked per record, not by campaign revision', () => {
     const { db } = tempDb();
     const c = newCampaign(db);
-    const { $door } = seed(db, c.id, [createOp('$door', 'item', 'Door', { open: false })]);
-    // Two turns plan against revision 0; the first commits.
+    const { $door, $lamp } = seed(db, c.id, [createOp('$door', 'item', 'Door', { open: false }), createOp('$lamp', 'item', 'Lamp', { lit: false })]);
+    // Two storylines plan at the same time; the first commits and bumps the campaign revision.
     const t1 = newTurn(db, c.id);
     const t2 = newTurn(db, c.id);
     const setOpen = (v: boolean) => op({ op: 'set', record_id: $door!, path: 'data.open', value_json: JSON.stringify(v), expected_version: 1 });
     expect(call(db, makeCtx(c.id, t1.id), 'save_turn', saveArgs({ operations: [setOpen(true)] })).json.ok).toBe(true);
+    // A different record still commits even though its plan predates the revision bump.
+    const lamp = op({ op: 'set', record_id: $lamp!, path: 'data.lit', value_json: 'true', expected_version: 1 });
+    expect(call(db, makeCtx(c.id, t2.id), 'save_turn', saveArgs({ operations: [lamp] })).json.ok).toBe(true);
+    // The same record with an old expected_version is refused and nothing is applied.
+    const t3 = newTurn(db, c.id);
     const before = snapshot(db, c.id);
-    const stale = call(db, makeCtx(c.id, t2.id), 'save_turn', saveArgs({ operations: [setOpen(false)] }));
+    const stale = call(db, makeCtx(c.id, t3.id), 'save_turn', saveArgs({ operations: [setOpen(false)] }));
     expect(stale.json.ok).toBe(false);
-    expect(stale.json.error).toMatch(/stale plan/);
+    expect(stale.json.error).toMatch(/version 2, not expected_version 1/);
     expect(snapshot(db, c.id)).toEqual(before);
-    // Re-planning against the fresh revision but with the old record version is also refused.
-    const stale2 = call(db, makeCtx(c.id, t2.id), 'save_turn', saveArgs({ expected_revision: 1, operations: [setOpen(false)] }));
-    expect(stale2.json.error).toMatch(/version 2, not expected_version 1/);
+    // A record the GM saw at an old version and then wrote without expectations is refused too.
+    const t4 = newTurn(db, c.id);
+    const ctx = { ...makeCtx(c.id, t4.id), seen: new Map([[$door!, 1]]) };
+    const delta = call(db, ctx, 'save_turn', saveArgs({ operations: [op({ op: 'archive', record_id: $door! })] }));
+    expect(delta.json.error).toMatch(/changed in another storyline/);
     expect(data(db, $door!).open).toBe(true);
-    expect(getTurn(db, t2.id)!.status).toBe('running');
+    expect(getTurn(db, t4.id)!.status).toBe('running');
+    // Non-play writes (e.g. owner corrections) keep the strict campaign revision check.
+    const t5 = newTurn(db, c.id);
+    const strict = call(db, { ...makeCtx(c.id, t5.id), mode: 'correction' as const }, 'save_turn', saveArgs({ operations: [] }));
+    expect(strict.json.error).toMatch(/stale plan/);
   });
 
   it('rejects unknown roll_ids and source_refs', () => {

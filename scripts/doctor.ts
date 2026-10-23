@@ -10,6 +10,8 @@ import { loadConfig, secretValues, type AppConfig } from '../src/config.js';
 import { isInstanceLocked, openDatabase, projectRoot, schemaVersion, type Db } from '../src/database.js';
 import { configureLog, redact } from '../src/log.js';
 import { createProvider } from '../src/providers.js';
+import { loadDioramaConfig } from '../src/diorama.js';
+import { loadImageConfig } from '../src/images.js';
 
 type Status = 'PASS' | 'WARN' | 'FAIL';
 let failures = 0;
@@ -151,6 +153,34 @@ if (config) {
   }
 
   // 10. Instance lock
+  // Optional scene illustrations through the local 2D workshop (free; never fatal).
+  const images = loadImageConfig();
+  if (!images.enabled) report('PASS', 'images', 'scene illustrations are off (IMAGE_GENERATION=comfy enables them)');
+  else {
+    const missing = [
+      [images.pipelineRoot, 'IMAGE_PIPELINE_ROOT'],
+      [images.python, 'IMAGE_PYTHON'],
+      [path.join(images.pipelineRoot, 'workshop', 'acquire.py'), 'workshop code'],
+    ].filter(([p]) => !fs.existsSync(p!));
+    report(
+      missing.length ? 'WARN' : 'PASS',
+      'images',
+      missing.length
+        ? `missing ${missing.map(([p, what]) => `${what} (${p})`).join(', ')}; the Illustrate button will report failures`
+        : `local pipeline at ${images.pipelineRoot} (${images.width}x${images.height}); ComfyUI starts on first image; references: ${images.references}`,
+    );
+  }
+
+  const dio = loadDioramaConfig();
+  if (!dio.enabled) report('PASS', 'dioramas', '3D dioramas are off (DIORAMA=on enables them)');
+  else {
+    const missing = [
+      [dio.blender, 'Blender (BLENDER_PATH)'],
+      [dio.python, 'workshop Python (IMAGE_PYTHON)'],
+    ].filter(([p]) => !fs.existsSync(p!));
+    report(missing.length ? 'WARN' : 'PASS', 'dioramas', missing.length ? `missing ${missing.map(([p, w]) => `${w} (${p})`).join(', ')}` : `Blender at ${dio.blender} (${dio.engine})`);
+  }
+
   try {
     const pid = isInstanceLocked(config.dataDir);
     report('PASS', 'instance lock', pid ? `held by running bot pid ${pid}` : 'no running bot holds the lock');

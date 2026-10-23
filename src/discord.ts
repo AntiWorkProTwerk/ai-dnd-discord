@@ -2,6 +2,7 @@
 // and the REST delivery adapter. Campaign and user identity always come from the verified
 // interaction; ordinary channel chat is never read (only the Guilds intent is requested).
 import {
+  type AutocompleteInteraction,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   Client,
@@ -10,22 +11,25 @@ import {
   GatewayIntentBits,
   InteractionContextType,
   MessageFlags,
+  type ModalSubmitInteraction,
   PermissionFlagsBits,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
   Routes,
   SlashCommandBuilder,
 } from 'discord.js';
+import fs from 'node:fs';
 import type { AppConfig } from './config.js';
-import { createCampaign, formatImportReport, isOwner, prepareImport, setLifecycle, WorkflowError } from './campaign.js';
+import { createCampaign, formatImportReport, isOwner, mayControlSeveral, prepareImport, setLifecycle, WorkflowError } from './campaign.js';
 import { effectiveBudget } from './agent.js';
-import { getCampaignByChannel, getMember, parseConfig, type Db } from './database.js';
+import { getCampaign, getCampaignByChannel, getMember, getRecord, getTurn, memberCharacterIds, parseConfig, type Db } from './database.js';
+import { campaignIdForThread } from './storylines.js';
 import { log } from './log.js';
 import { renderSheet, renderUsage, sanitize } from './render.js';
 import { DeliveryError, interactionUsable, type DeliveryPort, type DeliveryTarget, type OutboundMessage, type TurnRunner } from './turns.js';
 import type { CampaignRow, SourceRole } from './types.js';
 
 export function buildCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody[] {
-  const text = (desc: string) => (o: import('discord.js').SlashCommandStringOption) => o.setName('text').setDescription(desc).setRequired(true).setMaxLength(1800);
+  const text = (desc: string) => (o: import('discord.js').SlashCommandStringOption) => o.setName('text').setDescription(desc).setRequired(true).setMaxLength(4000);
   const cmd = new SlashCommandBuilder()
     .setName('rpg')
     .setDescription('AI game master')
@@ -60,10 +64,50 @@ export function buildCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody
     .addSubcommand((s) => s.setName('start').setDescription('Owner: start the campaign'))
     .addSubcommand((s) => s.setName('pause').setDescription('Owner: pause play'))
     .addSubcommand((s) => s.setName('resume').setDescription('Owner: resume play'))
-    .addSubcommand((s) => s.setName('character').setDescription('Create your character with the GM (several exchanges are fine)').addStringOption(text('Describe your character or answer the GM')))
-    .addSubcommand((s) => s.setName('play').setDescription('Act, speak, fight, build, explore — anything in the fiction').addStringOption(text('What your character does or says')))
+    .addSubcommand((s) =>
+      s
+        .setName('character')
+        .setDescription('Create your character with the GM (several exchanges are fine)')
+        .addStringOption(text('Describe your character or answer the GM')),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('play')
+        .setDescription('Act, speak, fight, build, explore — anything in the fiction')
+        .addStringOption(text('What your character does or says'))
+        .addBooleanOption((o) => o.setName('illustrate').setDescription('Also paint the scene with the local image pipeline').setRequired(false))
+        .addBooleanOption((o) => o.setName('private').setDescription('Play this in your own private side story (private thread)').setRequired(false))
+        .addBooleanOption((o) => o.setName('map').setDescription('Also post the battle map after the reply').setRequired(false))
+        .addBooleanOption((o) => o.setName('diorama').setDescription('Also post a 3D diorama of the battle map').setRequired(false))
+        .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true)),
+    )
     .addSubcommand((s) => s.setName('ask').setDescription('Ask a rules or public-world question (changes nothing)').addStringOption(text('Your question')))
-    .addSubcommand((s) => s.setName('sheet').setDescription('Show your character sheet and inventory'))
+    .addSubcommand((s) =>
+      s
+        .setName('sheet')
+        .setDescription('Show your character sheet and inventory')
+        .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true)),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('map')
+        .setDescription("Show the battle map of your character's current scene")
+        .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true)),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('diorama')
+        .setDescription("Show your scene's battle map as a 3D diorama")
+        .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true))
+        .addBooleanOption((o) => o.setName('turntable').setDescription('A short rotating video instead of a still').setRequired(false)),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('portrait')
+        .setDescription("Show your character's reference portrait (used to keep illustrations consistent)")
+        .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true))
+        .addBooleanOption((o) => o.setName('regenerate').setDescription('Paint a new portrait').setRequired(false)),
+    )
     .addSubcommand((s) => s.setName('recap').setDescription('Recap the story so far'))
     .addSubcommand((s) => s.setName('gm').setDescription('Owner: correction, clarification, or world-advance instruction').addStringOption(text('Instruction to the GM')))
     .addSubcommand((s) => s.setName('undo').setDescription('Owner: undo the latest world turn'))
@@ -86,13 +130,34 @@ function payload(message: OutboundMessage, ephemeral: boolean, withFlags: boolea
       : [],
   };
   if (withFlags && ephemeral) body.flags = MessageFlags.Ephemeral;
-  const files = message.file ? [{ name: message.file.name, data: Buffer.from(message.file.content, 'utf8') }] : undefined;
-  if (files) body.attachments = [{ id: 0, filename: message.file!.name }];
+  const file = message.file;
+  const files = file ? [{ name: file.name, data: file.path ? fs.readFileSync(file.path) : Buffer.from(file.content ?? '', 'utf8') }] : undefined;
+  if (files) body.attachments = [{ id: 0, filename: file!.name }];
+  if (message.replyTo) body.message_reference = { message_id: message.replyTo, fail_if_not_exists: false };
   return { body, files };
 }
 
 export function createDiscordDelivery(client: Client): DeliveryPort {
   return {
+    /** Persistent storyline thread: 7-day auto-archive (archived threads stay readable and reopen). */
+    async createThread(parentChannelId: string, name: string, isPrivate: boolean, memberUserIds: string[]): Promise<string> {
+      const res = (await client.rest.post(Routes.threads(parentChannelId), {
+        body: { name: name || 'Side story', type: isPrivate ? 12 : 11, auto_archive_duration: 10080, ...(isPrivate ? { invitable: false } : {}) },
+      })) as { id: string };
+      for (const userId of memberUserIds) {
+        try {
+          await client.rest.put(Routes.threadMembers(res.id, userId));
+        } catch (err) {
+          log.warn('could not add thread member', { thread: res.id, user: userId, err });
+        }
+      }
+      return res.id;
+    },
+
+    async archiveThread(threadId: string): Promise<void> {
+      await client.rest.patch(Routes.channel(threadId), { body: { archived: true } });
+    },
+
     async send(target: DeliveryTarget, message: OutboundMessage, index: number, nonce: string): Promise<string> {
       try {
         if (target.interaction && interactionUsable(target)) {
@@ -144,7 +209,7 @@ const OWNER_ONLY = new Set(['import', 'configure', 'start', 'pause', 'resume', '
 const MODEL_MODES = { play: 'play', ask: 'ask', recap: 'recap', character: 'character', gm: 'gm', configure: 'configure' } as const;
 const EPHEMERAL = new Set(['ask', 'character', 'gm', 'configure', 'import', 'usage', 'backup', 'sheet', 'undo', 'setup', 'start', 'pause', 'resume']);
 
-function targetOf(i: ChatInputCommandInteraction | ButtonInteraction, ephemeral: boolean): DeliveryTarget {
+function targetOf(i: ChatInputCommandInteraction | ButtonInteraction | ModalSubmitInteraction, ephemeral: boolean): DeliveryTarget {
   return {
     channelId: i.channelId!,
     ephemeral,
@@ -152,13 +217,21 @@ function targetOf(i: ChatInputCommandInteraction | ButtonInteraction, ephemeral:
   };
 }
 
-async function reply(i: ChatInputCommandInteraction | ButtonInteraction, content: string, ephemeral = true, buttons?: OutboundMessage['buttons']): Promise<void> {
+async function reply(i: ChatInputCommandInteraction | ButtonInteraction | ModalSubmitInteraction, content: string, ephemeral = true, buttons?: OutboundMessage['buttons']): Promise<void> {
   const components = buttons?.length
     ? [{ type: 1, components: buttons.map((b) => ({ type: 2, style: STYLE[b.style], label: b.label, custom_id: b.customId })) }]
     : [];
   const opts = { content: content.slice(0, 2000), allowedMentions: { parse: [] }, components } as never;
   if (i.deferred || i.replied) await i.editReply(opts);
   else await i.reply({ ...(opts as object), flags: ephemeral ? MessageFlags.Ephemeral : undefined } as never);
+}
+
+/** The campaign for a channel, or for a storyline thread the bot created under it. */
+export function campaignFor(db: Db, guildId: string, channelId: string) {
+  const direct = getCampaignByChannel(db, guildId, channelId);
+  if (direct) return direct;
+  const viaThread = campaignIdForThread(db, channelId);
+  return viaThread ? getCampaign(db, viaThread) : undefined;
 }
 
 export function canSetUp(i: ChatInputCommandInteraction, config: AppConfig): boolean {
@@ -170,10 +243,12 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
   const { db, config, runner } = deps;
   if (!i.inGuild() || !i.channelId) return reply(i, 'Use this command in a server channel.');
   const sub = i.options.getSubcommand();
-  const campaign = getCampaignByChannel(db, i.guildId, i.channelId);
+  const campaign = campaignFor(db, i.guildId, i.channelId);
+  log.info('command', { sub, user: i.user.id, name: i.user.username, channel: i.channelId, campaign: campaign?.id, text: i.options.getString('text') ?? undefined, as: i.options.getString('as') ?? undefined });
 
   if (sub === 'setup') {
     if (!canSetUp(i, config)) return reply(i, 'You need the Manage Channels permission in this channel to create a campaign here.');
+    if (campaign) return reply(i, 'This channel (or storyline thread) already belongs to a campaign.');
     try {
       const c = createCampaign(db, {
         guildId: i.guildId,
@@ -199,6 +274,7 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
   if (!campaign) return reply(i, 'There is no campaign in this channel. An owner can create one with `/rpg setup`.');
   if (OWNER_ONLY.has(sub) && !isOwner(campaign, i.user.id)) return reply(i, 'Only the campaign owner can use that command.');
 
+  let characterId: string | undefined;
   switch (sub) {
     case 'start':
     case 'pause':
@@ -212,8 +288,38 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
       }
       return;
     }
-    case 'sheet':
-      return reply(i, renderSheet(db, campaign, i.user.id));
+    case 'map': {
+      const chosen = pickCharacter(db, campaign, i);
+      if (chosen.error) return reply(i, chosen.error);
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = await runner.mapNow(campaign, i.user.id, chosen.id);
+      return reply(i, r.channelId && r.channelId !== i.channelId ? `${r.message} See <#${r.channelId}>.` : r.message);
+    }
+    case 'diorama': {
+      const chosen = pickCharacter(db, campaign, i);
+      if (chosen.error) return reply(i, chosen.error);
+      return reply(i, runner.dioramaNow(campaign, i.user.id, chosen.id, { turntable: i.options.getBoolean('turntable') ?? false }).message);
+    }
+    case 'portrait': {
+      const chosen = pickCharacter(db, campaign, i);
+      if (chosen.error) return reply(i, chosen.error);
+      const id = chosen.id ?? getMember(db, campaign.id, i.user.id)?.character_record_id;
+      if (!id) return reply(i, 'You have no character here yet: `/rpg character`.');
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = runner.paintPortrait(campaign.id, id, { force: i.options.getBoolean('regenerate') ?? false });
+      if (!r.done) return reply(i, r.message);
+      if (r.message !== 'ready') await reply(i, `${r.message} This takes about a minute.`);
+      const p = await r.done;
+      if (!p) return reply(i, "🖼️ Couldn't paint the portrait (see the bot log). Try again later.");
+      const name = getRecord(db, campaign.id, id)?.name ?? 'Your character';
+      await i.editReply({ content: `🖼️ **${sanitize(name)}**`, files: [{ attachment: p.path, name: 'portrait.png' }], allowedMentions: { parse: [] } });
+      return;
+    }
+    case 'sheet': {
+      const chosen = pickCharacter(db, campaign, i);
+      if (chosen.error) return reply(i, chosen.error);
+      return reply(i, renderSheet(db, campaign, i.user.id, chosen.id));
+    }
     case 'usage':
       return reply(i, renderUsage(db, campaign, effectiveBudget(config, parseConfig(campaign), false)));
     case 'backup': {
@@ -243,11 +349,15 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
       if (campaign.status !== 'active') return reply(i, `The campaign is ${campaign.status === 'setup' ? 'not started yet' : campaign.status}.`);
       const m = getMember(db, campaign.id, i.user.id);
       if (!m?.character_record_id) return reply(i, 'You need a character in this campaign first: `/rpg character`.');
+      const chosen = pickCharacter(db, campaign, i);
+      if (chosen.error) return reply(i, chosen.error);
+      characterId = chosen.id;
       break;
     }
     case 'character': {
       const m = getMember(db, campaign.id, i.user.id);
-      if (m?.character_record_id) return reply(i, 'You already have a character here. Use `/rpg sheet` to view it.');
+      // The owner may create more characters; every /rpg character conversation makes a new one.
+      if (m?.character_record_id && !mayControlSeveral(campaign, i.user.id)) return reply(i, 'You already have a character here. Use `/rpg sheet` to view it.');
       break;
     }
   }
@@ -258,7 +368,11 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
   // Model work can take longer than Discord's 3-second window: defer first.
   await i.deferReply(ephemeral ? { flags: MessageFlags.Ephemeral } : {});
   const text = sub === 'recap' ? 'recap' : i.options.getString('text', true);
-  const r = runner.submit({ campaign, userId: i.user.id, mode, requestId: i.id, text, target: targetOf(i, ephemeral) });
+  const illustrate = sub === 'play' ? (i.options.getBoolean('illustrate') ?? false) : false;
+  const map = sub === 'play' ? (i.options.getBoolean('map') ?? false) : false;
+  const diorama = sub === 'play' ? (i.options.getBoolean('diorama') ?? false) : false;
+  const privateStory = sub === 'play' ? (i.options.getBoolean('private') ?? false) : false;
+  const r = runner.submit({ campaign, userId: i.user.id, mode, requestId: i.id, text, target: targetOf(i, ephemeral), illustrate, privateStory, characterId, map, diorama });
   if (r.status !== 'queued') await reply(i, r.message ?? 'Request not accepted.');
 }
 
@@ -301,14 +415,77 @@ async function handleImport(deps: DiscordDeps, i: ChatInputCommandInteraction, c
   }
 }
 
+/** Resolves the `as` option to one of the user's own characters (by ID from autocomplete, or by name). */
+function pickCharacter(db: Db, campaign: CampaignRow, i: ChatInputCommandInteraction): { id?: string; error?: string } {
+  const wanted = i.options.getString('as')?.trim();
+  if (!wanted) return {};
+  const owned = memberCharacterIds(getMember(db, campaign.id, i.user.id));
+  const match =
+    owned.find((id) => id === wanted) ??
+    owned.find((id) => getRecord(db, campaign.id, id)?.name.toLowerCase() === wanted.toLowerCase()) ??
+    owned.find((id) => getRecord(db, campaign.id, id)?.name.toLowerCase().startsWith(wanted.toLowerCase()));
+  if (match) return { id: match };
+  const names = owned.map((id) => getRecord(db, campaign.id, id)?.name).filter(Boolean);
+  return { error: names.length ? `You don't control a character called "${sanitize(wanted)}". Yours: ${names.map((n) => sanitize(n!)).join(', ')}.` : 'You have no character here yet: `/rpg character`.' };
+}
+
+/** Suggests the user's own characters for the `as` option. */
+export async function handleAutocomplete(deps: DiscordDeps, i: AutocompleteInteraction): Promise<void> {
+  const campaign = i.inGuild() && i.channelId ? campaignFor(deps.db, i.guildId, i.channelId) : undefined;
+  const member = campaign ? getMember(deps.db, campaign.id, i.user.id) : undefined;
+  const typed = String(i.options.getFocused()).toLowerCase();
+  const choices = memberCharacterIds(member)
+    .map((id) => ({ id, name: getRecord(deps.db, campaign!.id, id)?.name ?? id }))
+    .filter((c) => c.name.toLowerCase().includes(typed))
+    .slice(0, 25)
+    .map((c) => ({ name: (c.id === member?.character_record_id ? `${c.name} (active)` : c.name).slice(0, 100), value: c.id }));
+  await i.respond(choices);
+}
+
 export async function handleButton(deps: DiscordDeps, i: ButtonInteraction): Promise<void> {
   const m = /^rpg:(\w+):(\d+):([a-z0-9]+)$/.exec(i.customId);
   if (!m || !i.inGuild() || !i.channelId) return;
-  const campaign = getCampaignByChannel(deps.db, i.guildId, i.channelId);
+  const campaign = campaignFor(deps.db, i.guildId, i.channelId);
   if (!campaign) return reply(i, 'No campaign in this channel.');
+  log.info('button', { kind: m[1], turn: Number(m[2]), user: i.user.id, name: i.user.username });
+  if (m[1] === 'say') {
+    // Discord cannot reply to an ephemeral message, so the Reply button opens a text box instead.
+    await i.showModal({
+      custom_id: `rpg:sayf:${m[2]}:0`,
+      title: 'Reply to the GM',
+      components: [{ type: 1, components: [{ type: 4, custom_id: 'text', label: 'Your reply', style: 2, max_length: 4000, required: true }] }],
+    } as never);
+    return;
+  }
   await i.deferReply({ flags: MessageFlags.Ephemeral });
-  const result = await deps.runner.confirm({ kind: m[1]!, turnId: Number(m[2]), nonce: m[3]!, userId: i.user.id, campaign, target: targetOf(i, true) });
+  const result =
+    m[1] === 'img'
+      ? deps.runner.illustrate(Number(m[2]), campaign.id).message
+      : m[1] === 'map'
+      ? await deps.runner.postMap(Number(m[2]), campaign.id)
+      : m[1] === 'dio'
+      ? deps.runner.diorama(Number(m[2]), campaign.id).message
+      : await deps.runner.confirm({ kind: m[1]!, turnId: Number(m[2]), nonce: m[3]!, userId: i.user.id, campaign, target: targetOf(i, true) });
+  log.info('button result', { kind: m[1], turn: Number(m[2]), user: i.user.id, result });
   await reply(i, result);
+}
+
+/** A reply typed into the Reply box continues that conversation as the same player's next message. */
+export async function handleModal(deps: DiscordDeps, i: ModalSubmitInteraction): Promise<void> {
+  const { db, runner } = deps;
+  const m = /^rpg:sayf:(\d+):0$/.exec(i.customId);
+  if (!m || !i.inGuild() || !i.channelId) return;
+  const campaign = campaignFor(db, i.guildId, i.channelId);
+  if (!campaign) return reply(i, 'No campaign in this channel.');
+  const prior = getTurn(db, Number(m[1]));
+  const text = i.fields.getTextInputValue('text');
+  log.info('modal reply', { turn: Number(m[1]), user: i.user.id, name: i.user.username, text });
+  if (!prior || prior.campaign_id !== campaign.id || prior.mode !== 'character') return reply(i, 'That conversation is no longer available.');
+  if (prior.actor_user_id !== i.user.id) return reply(i, 'Only the player in this conversation can reply to it.');
+  if (getMember(db, campaign.id, i.user.id)?.character_record_id && !mayControlSeveral(campaign, i.user.id)) return reply(i, 'You already have a character here. Use `/rpg sheet` to view it.');
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  const r = runner.submit({ campaign, userId: i.user.id, mode: 'character', requestId: i.id, text, target: targetOf(i, true) });
+  if (r.status !== 'queued') await reply(i, r.message ?? 'Request not accepted.');
 }
 
 export function createDiscordClient(): Client {
@@ -321,6 +498,8 @@ export function attachHandlers(client: Client, deps: DiscordDeps): void {
     const run = async () => {
       if (interaction.isChatInputCommand() && interaction.commandName === 'rpg') await handleCommand(deps, interaction);
       else if (interaction.isButton() && interaction.customId.startsWith('rpg:')) await handleButton(deps, interaction);
+      else if (interaction.isAutocomplete() && interaction.commandName === 'rpg') await handleAutocomplete(deps, interaction);
+      else if (interaction.isModalSubmit() && interaction.customId.startsWith('rpg:sayf:')) await handleModal(deps, interaction);
     };
     run().catch(async (err) => {
       log.error('interaction failed', { err });

@@ -109,6 +109,37 @@ export function listMembers(db: Db, campaignId: string): MemberRow[] {
   return db.prepare('SELECT * FROM members WHERE campaign_id = ? ORDER BY created_at').all(campaignId) as MemberRow[];
 }
 
+/** Every character a member controls, active one first. */
+export function memberCharacterIds(m: MemberRow | undefined): string[] {
+  if (!m) return [];
+  const ids = JSON.parse(m.character_ids_json || '[]') as string[];
+  const active = m.character_record_id;
+  return active ? [active, ...ids.filter((id) => id !== active)] : ids;
+}
+
+/**
+ * A new player character may not reuse a player character's name (case-insensitive), so `as:<name>`
+ * and narration stay unambiguous. Returns a message for the player, or null.
+ */
+export function characterNameClash(db: Db, campaignId: string, userId: string, name: string): string | null {
+  const wanted = name.trim().toLowerCase();
+  for (const [id, owner] of playerCharacterOwners(db, campaignId)) {
+    const existing = getRecord(db, campaignId, id);
+    if (!existing || existing.name.trim().toLowerCase() !== wanted) continue;
+    return owner === userId
+      ? `you already have a character named ${existing.name}; play them with \`/rpg play as:${existing.name}\`, or give this new character a different name`
+      : `another player's character is already named ${existing.name}; choose a different name`;
+  }
+  return null;
+}
+
+/** Player character ID → the Discord user who controls it. */
+export function playerCharacterOwners(db: Db, campaignId: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const m of listMembers(db, campaignId)) for (const id of memberCharacterIds(m)) out.set(id, m.discord_user_id);
+  return out;
+}
+
 // ---------------------------------------------------------------- records
 
 /** Campaign-scoped lookup. An ID from another campaign is simply not found. */
@@ -143,6 +174,7 @@ export interface NewTurn {
   delivery_json?: string;
   confirm_nonce?: string | null;
   expires_at?: string | null;
+  scene_id?: string | null;
 }
 
 /** Inserts a turn; returns the existing row instead when the request ID was already used. */
@@ -154,10 +186,10 @@ export function insertTurn(db: Db, t: NewTurn): { turn: TurnRow; created: boolea
     .prepare(
       `INSERT INTO turns (campaign_id, request_id, actor_user_id, actor_character_id, mode, status, input_text,
          base_revision, source_version, changes_json, public_reply, gm_note, delivery_json, confirm_nonce, expires_at,
-         created_at, updated_at)
+         scene_id, created_at, updated_at)
        VALUES (@campaign_id, @request_id, @actor_user_id, @actor_character_id, @mode, @status, @input_text,
          @base_revision, @source_version, @changes_json, @public_reply, @gm_note, @delivery_json, @confirm_nonce,
-         @expires_at, @ts, @ts)`,
+         @expires_at, @scene_id, @ts, @ts)`,
     )
     .run({
       actor_character_id: null,
@@ -170,6 +202,7 @@ export function insertTurn(db: Db, t: NewTurn): { turn: TurnRow; created: boolea
       delivery_json: '{}',
       confirm_nonce: null,
       expires_at: null,
+      scene_id: null,
       ...t,
       ts,
     });
@@ -197,6 +230,7 @@ const TURN_COLUMNS = new Set([
   'expires_at',
   'committed_revision',
   'reverted_by_turn_id',
+  'scene_id',
   'attempts',
   'error',
 ]);

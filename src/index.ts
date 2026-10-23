@@ -6,19 +6,27 @@ import { Semaphore } from './agent.js';
 import { loadConfig, secretValues } from './config.js';
 import { acquireInstanceLock, openDatabase } from './database.js';
 import { attachHandlers, createDiscordClient, createDiscordDelivery } from './discord.js';
-import { configureLog, log } from './log.js';
+import path from 'node:path';
+import { configureLog, configureLogFile, log } from './log.js';
+import { createDioramaRenderer, loadDioramaConfig } from './diorama.js';
+import { createWorkshopGenerator, ImageQueue, loadImageConfig } from './images.js';
 import { createProvider } from './providers.js';
 import { TurnRunner } from './turns.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
   configureLog(config.logLevel, secretValues(config));
+  configureLogFile(path.join(config.dataDir, 'logs'));
   if (!config.discord.token) throw new Error('DISCORD_TOKEN is required to run the bot (see .env.example)');
 
   const releaseLock = acquireInstanceLock(config.dataDir);
   const db = openDatabase(config.databasePath);
   const provider = createProvider(config);
-  log.info('starting', { provider: provider.name, model: provider.model, database: config.databasePath });
+  const imageConfig = loadImageConfig();
+  const dioramaConfig = loadDioramaConfig();
+  // Paintings and dioramas share one GPU queue: one heavy job at a time.
+  const gpuQueue = new ImageQueue(imageConfig.maxQueue);
+  log.info('starting', { provider: provider.name, model: provider.model, database: config.databasePath, images: imageConfig.enabled ? imageConfig.pipelineRoot : 'off' });
 
   const client = createDiscordClient();
   const runner = new TurnRunner({
@@ -27,6 +35,8 @@ async function main(): Promise<void> {
     provider,
     delivery: createDiscordDelivery(client),
     modelLimiter: new Semaphore(config.limits.maxConcurrentModelTurns),
+    images: imageConfig.enabled ? { generator: createWorkshopGenerator(imageConfig), queue: gpuQueue, config: imageConfig } : undefined,
+    diorama: dioramaConfig.enabled ? { renderer: createDioramaRenderer(dioramaConfig), queue: gpuQueue } : undefined,
   });
   attachHandlers(client, { db, config, runner });
 

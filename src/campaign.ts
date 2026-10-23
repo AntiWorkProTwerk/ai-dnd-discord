@@ -9,9 +9,11 @@ import {
   getCampaign,
   getMember,
   getRecord,
+  characterNameClash,
   getTurn,
   insertTurn,
-  listMembers,
+  memberCharacterIds,
+  playerCharacterOwners,
   nowIso,
   parseConfig,
   randomToken,
@@ -24,10 +26,10 @@ import type { CampaignConfig, CampaignRow, Constraint, RecordRow, SourceRole, Tu
 import { validateConstraintList, ValidationError } from './validation.js';
 
 export const DEFAULT_CONVENTIONS = [
-  'character / npc data: hp {current, max}; conditions [strings]; coins {<currency>: integer}; plus the stats the rules use, always under the same keys.',
+  'character / npc data: appearance (one visual sentence: sex, age, build, hair, face, clothing; used for portraits and illustrations); hp {current, max}; conditions [strings]; coins {<currency>: integer}; plus the stats the rules use, always under the same keys.',
   'item data: quantity (integer >= 0), description, and rule properties (damage, weight, charges, price) as needed.',
   'location data: description; exits [{to_id, label}].',
-  'scene data: status ("active" | "ended"); participants_ids [ids]; initiative [{id, value}]; turn_of_id; round; time (in-world time of day/date); pending_decision.',
+  'scene data (one scene per storyline): status ("active" | "ended"); main (true only for the main storyline); participants_ids [ids]; initiative [{id, value}]; turn_of_id; round; time_min (integer in-world minutes since Day 1 00:00); time (readable form); busy_until_min (long action in progress); pending_decision; map {cols, rows, cell_ft, features [{kind, label, x, y, w, h}]} and positions {<id>: {x, y, size}} (battle map; hidden ones in gm_notes.positions).',
   'quest data: status ("open" | "completed" | "failed"); objectives [strings]; giver_id; reward.',
   'event data: due (in-world time), description. faction/relationship data: attitude, notes.',
 ].join('\n');
@@ -73,6 +75,7 @@ export function defaultConfig(input: Omit<SetupInput, 'guildId' | 'channelId' | 
     starting_situation: '',
     constraints: [],
     model: { reasoning_effort: null },
+    time_sync_window_minutes: 60,
     budget: { monthly_usd: null, max_turn_usd: null },
   };
 }
@@ -100,6 +103,11 @@ export function createCampaign(db: Db, input: SetupInput): CampaignRow {
 
 export function isOwner(campaign: CampaignRow, userId: string): boolean {
   return campaign.owner_user_id === userId;
+}
+
+/** The campaign owner may control several characters (to test parallel storylines alone); players control one. */
+export function mayControlSeveral(campaign: CampaignRow, userId: string): boolean {
+  return isOwner(campaign, userId);
 }
 
 export function requireOwner(campaign: CampaignRow, userId: string): void {
@@ -350,7 +358,7 @@ export const CONFIG_PROPOSAL_SCHEMA: Record<string, unknown> = {
       required: [
         'title', 'premise', 'rules_edition', 'tone', 'max_players', 'boundaries', 'require_character_approval', 'rules_digest',
         'setting_summary', 'conventions', 'character_creation', 'house_rules', 'precedence', 'provisional_ruling_policy',
-        'starting_situation', 'constraints',
+        'starting_situation', 'constraints', 'time_sync_window_minutes',
       ],
       properties: {
         title: nullableString,
@@ -368,6 +376,7 @@ export const CONFIG_PROPOSAL_SCHEMA: Record<string, unknown> = {
         precedence: { type: ['array', 'null'], items: { type: 'string' } },
         provisional_ruling_policy: nullableString,
         starting_situation: nullableString,
+        time_sync_window_minutes: { type: ['integer', 'null'], description: 'Shared world clock: in-world minutes one storyline may run ahead of the others' },
         constraints: {
           type: ['array', 'null'],
           items: {
@@ -408,6 +417,7 @@ const ProposalZod = z.object({
     precedence: z.array(z.string().max(40)).max(8).nullable(),
     provisional_ruling_policy: z.string().max(1000).nullable(),
     starting_situation: z.string().max(3000).nullable(),
+    time_sync_window_minutes: z.number().int().min(0).max(10080).nullable().optional(),
     constraints: z.array(z.object({ kind: z.string(), path: z.string(), rule: z.string(), value_json: z.string().nullable() })).max(50).nullable(),
   }),
   starting_operations: z.array(z.any()).max(40),
@@ -543,8 +553,11 @@ export function characterDraftProblem(db: Db, turn: TurnRow): string | null {
   if (!ops.length) return 'no sheet proposed yet';
   if (chars.length !== 1) return 'a character draft must create exactly one record of kind "character"';
   if (ops.some((o) => o.op !== 'create')) return 'a character draft may only create new records';
+  const clash = characterNameClash(db, turn.campaign_id, turn.actor_user_id, chars[0]!.name ?? '');
+  if (clash) return clash;
   const member = getMember(db, turn.campaign_id, turn.actor_user_id);
-  if (member?.character_record_id) return 'you already have a character in this campaign';
+  const campaign = getCampaign(db, turn.campaign_id);
+  if (member?.character_record_id && !(campaign && mayControlSeveral(campaign, turn.actor_user_id))) return 'you already have a character in this campaign';
   return null;
 }
 
@@ -561,7 +574,7 @@ export function acceptCharacter(db: Db, turn: TurnRow, approvedByOwner: boolean,
     const nonce = markProposed(db, turn.id, ttlMs * 8, 'awaiting_owner');
     return { status: 'awaiting_owner', nonce };
   }
-  const players = listMembers(db, campaign.id).filter((m) => m.character_record_id).length;
+  const players = playerCharacterOwners(db, campaign.id).size;
   if (players >= config.max_players) failClaimed(db, turn.id, `This campaign is full (${config.max_players} characters).`);
 
   const { ops } = createdCharacters(turn);
@@ -577,13 +590,18 @@ export function acceptCharacter(db: Db, turn: TurnRow, approvedByOwner: boolean,
     const characterId = result.created[ref]!;
     db.transaction(() => {
       const existing = getMember(db, campaign.id, turn.actor_user_id);
-      if (existing?.character_record_id) throw new WorkflowError('You already have a character in this campaign.');
-      if (existing) db.prepare('UPDATE members SET character_record_id = ? WHERE campaign_id = ? AND discord_user_id = ?').run(characterId, campaign.id, turn.actor_user_id);
+      const owned = memberCharacterIds(existing);
+      if (owned.length && !mayControlSeveral(campaign, turn.actor_user_id)) throw new WorkflowError('You already have a character in this campaign.');
+      // The new character becomes the member's active one; earlier ones stay under their control.
+      const ids = JSON.stringify([...owned, characterId]);
+      if (existing)
+        db.prepare('UPDATE members SET character_record_id = ?, character_ids_json = ? WHERE campaign_id = ? AND discord_user_id = ?').run(characterId, ids, campaign.id, turn.actor_user_id);
       else
-        db.prepare(`INSERT INTO members (campaign_id, discord_user_id, character_record_id, role, created_at) VALUES (?, ?, ?, 'player', ?)`).run(
+        db.prepare(`INSERT INTO members (campaign_id, discord_user_id, character_record_id, character_ids_json, role, created_at) VALUES (?, ?, ?, ?, 'player', ?)`).run(
           campaign.id,
           turn.actor_user_id,
           characterId,
+          ids,
           nowIso(),
         );
       db.prepare('UPDATE turns SET actor_character_id = ? WHERE id = ?').run(characterId, turn.id);

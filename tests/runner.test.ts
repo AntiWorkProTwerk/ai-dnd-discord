@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Semaphore } from '../src/agent.js';
 import { createCampaign, prepareImport } from '../src/campaign.js';
 import { loadConfig, type AppConfig } from '../src/config.js';
-import { getCampaign, getMember, getRecord, getTurn, listMembers, monthUsage, openDatabase, type Db } from '../src/database.js';
+import { getCampaign, getMember, getRecord, getTurn, listMembers, memberCharacterIds, monthUsage, openDatabase, type Db } from '../src/database.js';
 import type { ModelProvider, ProviderRequest, ProviderResponse, ToolCall } from '../src/providers.js';
 import { planBatch, writeBatch } from '../src/records.js';
 import { renderSheet } from '../src/render.js';
@@ -182,6 +182,21 @@ describe('play turns', () => {
     expect(delivery.sent).toHaveLength(1);
   });
 
+  it('keeps long player text intact from submission through storage and the posted reply', async () => {
+    const long = `I climb the bell tower. ${'Step by careful step, I test each rung. '.repeat(90)}THE END.`;
+    expect(long.length).toBeGreaterThan(3000);
+    provider.steps.push((req) => {
+      expect((req.items[0] as { text: string }).text).toContain('THE END.');
+      return { toolCalls: [save(1, [], 'You climb.')] };
+    });
+    const r = runner.submit({ campaign, userId: ALICE, mode: 'play', requestId: 'long', text: long, target: target() });
+    await runner.idle();
+    expect(getTurn(db, r.turnId!)!.input_text).toBe(long);
+    const posted = delivery.sent.map((s) => s.message.content).join('\n');
+    expect(posted).toContain('You climb.');
+    for (const s of delivery.sent) expect(s.message.content.length).toBeLessThanOrEqual(2000);
+  });
+
   it('rejects a full queue with a clear message instead of accepting unlimited work', () => {
     makeRunner(new FakeProvider(), { MAX_QUEUED_TURNS_PER_CAMPAIGN: '1' });
     provider.steps.push(() => ({ toolCalls: [save(1, [])] }));
@@ -345,6 +360,66 @@ describe('character creation', () => {
     expect(pc.private_owner_user_id).toBe(BOB);
     expect(await runner.confirm({ kind: 'chr', turnId: t.id, nonce, userId: BOB, campaign, target: target(true) })).toMatch(/already/);
     expect(db.prepare(`SELECT COUNT(*) AS n FROM records WHERE kind = 'character' AND name = 'Tobin'`).get()).toEqual({ n: 1 });
+  });
+
+  it('lets the owner create and play several characters; a player cannot act as one they do not control', async () => {
+    const make = async (name: string, requestId: string) => {
+      const rev = getCampaign(db, campaign.id)!.revision;
+      provider.steps.push(() => ({ toolCalls: [save(rev, [op({ op: 'create', ref: '$pc', kind: 'character', name, data_json: '{"hp":{"current":8,"max":8}}' })], `Here is ${name}.`)] }));
+      const r = runner.submit({ campaign, userId: OWNER, mode: 'character', requestId, text: `Make ${name}`, target: target(true) });
+      await runner.idle();
+      const t = getTurn(db, r.turnId!)!;
+      expect(await runner.confirm({ kind: 'chr', turnId: t.id, nonce: t.confirm_nonce!, userId: OWNER, campaign, target: target(true) })).toMatch(/Character created/);
+    };
+    await make('Tobin', 'mc1');
+    // Reusing a name is refused at save time, so the GM asks for another one instead.
+    const rev = getCampaign(db, campaign.id)!.revision;
+    let refusal = '';
+    provider.steps.push(() => ({ toolCalls: [save(rev, [op({ op: 'create', ref: '$pc', kind: 'character', name: 'tobin', data_json: '{}' })])] }));
+    provider.steps.push((req) => {
+      refusal = JSON.stringify(req.items.at(-1));
+      return { toolCalls: [save(rev, [], 'You already have Tobin. What should the new one be called?')] };
+    });
+    runner.submit({ campaign, userId: OWNER, mode: 'character', requestId: 'mc-dup', text: 'another one called tobin', target: target(true) });
+    await runner.idle();
+    expect(refusal).toMatch(/Name taken: you already have a character named Tobin/);
+    // The GM's question carries a Reply button, since an ephemeral message cannot be replied to.
+    expect(delivery.sent.at(-1)!.message.buttons?.map((b) => b.customId)).toEqual([expect.stringMatching(/^rpg:say:\d+:0$/)]);
+    await make('Wren', 'mc2');
+    const second = (provider.calls.at(-1)!.items[0] as { text: string }).text;
+    expect(second).toContain('ADDITIONAL');
+    expect(second).not.toContain('Player: Make Tobin'); // the finished character's exchange is not this draft's history
+
+    const m = getMember(db, campaign.id, OWNER)!;
+    const [wren, tobin] = memberCharacterIds(m);
+    expect(getRecord(db, campaign.id, wren!)!.name).toBe('Wren');
+    expect(getRecord(db, campaign.id, tobin!)!.name).toBe('Tobin');
+    expect(getRecord(db, campaign.id, tobin!)!.private_owner_user_id).toBe(OWNER);
+
+    // Acting as Tobin makes Tobin the actor (and the active character); Wren is listed as not acting.
+    provider.steps.push(() => ({ toolCalls: [save(1, [], 'Tobin waves.')] }));
+    const r = runner.submit({ campaign, userId: OWNER, mode: 'play', requestId: 'mc3', text: 'wave', target: target(), characterId: tobin });
+    await runner.idle();
+    expect(getTurn(db, r.turnId!)!.actor_character_id).toBe(tobin);
+    expect(getMember(db, campaign.id, OWNER)!.character_record_id).toBe(tobin);
+    const ctx = (provider.calls.at(-1)!.items[0] as { text: string }).text;
+    expect(ctx).toMatch(/Acting character[^\n]*\n[^\n]*"name":"Tobin"/);
+    expect(ctx).toMatch(/Wren[^\n]*same player, but NOT acting now/);
+
+    expect(runner.submit({ campaign, userId: ALICE, mode: 'play', requestId: 'mc4', text: 'steal', target: target(), characterId: tobin })).toMatchObject({
+      status: 'rejected',
+      message: expect.stringMatching(/do not control/),
+    });
+    expect(getMember(db, campaign.id, ALICE)!.character_record_id).toBe(aliceChar);
+  });
+
+  it('keeps ordinary players to one character', async () => {
+    provider.steps.push(() => ({ toolCalls: [save(1, draftOps)] }));
+    const r = runner.submit({ campaign, userId: ALICE, mode: 'character', requestId: 'mc5', text: 'another one', target: target(true) });
+    await runner.idle();
+    const t = getTurn(db, r.turnId!)!;
+    expect(t.status).not.toBe('proposed');
+    expect(memberCharacterIds(getMember(db, campaign.id, ALICE))).toEqual([aliceChar]);
   });
 
   it('routes the draft to the owner when the campaign requires approval', async () => {

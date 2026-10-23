@@ -2,11 +2,12 @@
 // campaign, actor, turn, mode and permissions from the server-side ToolContext; no argument can
 // name a campaign or a Discord user. All SQL is parameterized and every result is bounded.
 import { z } from 'zod';
-import { getCampaign, getTurn, nowIso, parseConfig, type Db } from './database.js';
+import { characterNameClash, playerCharacterOwners, getCampaign, getRecord, getTurn, nowIso, parseConfig, type Db } from './database.js';
+import { formatClock, syncWindow, worldClock } from './storylines.js';
 import { rollForTurn, type RollRecord } from './dice.js';
 import { planBatch, writeBatch, type RawOperation } from './records.js';
 import type { ToolSpec } from './providers.js';
-import type { RecordRow, ToolContext, TurnRow } from './types.js';
+import type { CampaignRow, RecordRow, ToolContext, TurnRow } from './types.js';
 import { LIMITS, ValidationError } from './validation.js';
 
 const nullable = (type: string | string[], extra: Record<string, unknown> = {}) => ({
@@ -368,6 +369,7 @@ function readRecords(env: ToolEnv, a: z.infer<typeof ReadArgs>) {
   }
 
   const childStmt = db.prepare('SELECT * FROM records WHERE campaign_id = ? AND parent_id = ? AND archived_at IS NULL ORDER BY kind, name LIMIT 60');
+  for (const r of rows) ctx.seen?.set(r.id, r.version);
   const records = rows.map((r) => projectRecord(r, ctx, a.include_children ? (childStmt.all(ctx.campaignId, r.id) as RecordRow[]) : undefined));
 
   const out: Record<string, unknown> = { ok: true, records, next_cursor: nextCursor };
@@ -382,7 +384,9 @@ function escapeLike(s: string): string {
 
 export function readEvents(env: ToolEnv, recordId: string | null, query: string | null) {
   const { db, ctx } = env;
-  const where = [`campaign_id = @campaign`, `status IN ('committed', 'delivered')`, `mode IN ('play', 'correction', 'undo', 'character')`];
+  // Character-creation replies were private to one player; only the GM view sees them in history.
+  const modes = ctx.view === 'gm' ? "'play', 'correction', 'undo', 'character'" : "'play', 'correction', 'undo'";
+  const where = [`campaign_id = @campaign`, `status IN ('committed', 'delivered')`, `mode IN (${modes})`];
   const params: Record<string, unknown> = { campaign: ctx.campaignId };
   if (recordId) {
     where.push(`changes_json LIKE @rid ESCAPE '\\'`);
@@ -492,6 +496,12 @@ function saveTurn(env: ToolEnv, a: SaveTurnArgs): ToolOutcome {
     if (a.expected_revision !== campaign.revision) {
       throw new ValidationError(`campaign is at revision ${campaign.revision}, not ${a.expected_revision}; re-read and plan again`);
     }
+    if (ctx.mode === 'character') {
+      for (const o of ops) {
+        const clash = o.op === 'create' && (o.kind ?? '').toLowerCase() === 'character' ? characterNameClash(db, ctx.campaignId, ctx.actorUserId, o.name ?? '') : null;
+        if (clash) throw new ValidationError(`Name taken: ${clash}. Ask the player for another name (save an empty batch with the question).`);
+      }
+    }
     const plan = planBatch(db, ops, batchOpts);
     const draft = { operations: a.operations, diffs: plan.diffs, created: plan.created, source_refs: a.source_refs, roll_ids: a.roll_ids };
     db.prepare('UPDATE turns SET changes_json = ?, public_reply = ?, gm_note = ?, base_revision = ?, updated_at = ? WHERE id = ?').run(
@@ -515,7 +525,7 @@ function saveTurn(env: ToolEnv, a: SaveTurnArgs): ToolOutcome {
 /** Validates and applies a save_turn batch atomically; marks the turn committed. */
 export function commitTurn(
   db: Db,
-  ctx: Pick<ToolContext, 'campaignId' | 'turnId' | 'mode'>,
+  ctx: Pick<ToolContext, 'campaignId' | 'turnId' | 'mode'> & Partial<Pick<ToolContext, 'seen' | 'actorCharacterId'>>,
   a: Pick<SaveTurnArgs, 'expected_revision' | 'operations' | 'public_reply' | 'gm_note' | 'source_refs' | 'roll_ids'>,
   batchOpts: Parameters<typeof planBatch>[2],
   turnStatusRequired: TurnRow['status'][] = ['running'],
@@ -527,12 +537,29 @@ export function commitTurn(
     const campaign = getCampaign(db, ctx.campaignId);
     if (!campaign) throw new ValidationError('campaign not found');
     if (ctx.mode === 'play' && campaign.status !== 'active') throw new ValidationError(`campaign is ${campaign.status}; play is not open`);
-    if (campaign.revision !== a.expected_revision) {
+    // Play turns in different storylines commit concurrently, so they are checked per record
+    // (below) instead of against the campaign-wide revision; other writes keep the strict check.
+    if (ctx.mode !== 'play' && campaign.revision !== a.expected_revision) {
       throw new ValidationError(
         `stale plan: campaign is at revision ${campaign.revision}, not ${a.expected_revision}. Re-read the records you change and save again, reusing existing check_ids.`,
       );
     }
     const plan = planBatch(db, a.operations as RawOperation[], batchOpts);
+    if (ctx.mode === 'play') {
+      const stale: string[] = [];
+      for (const [id, prior] of plan.before) {
+        const seenVersion = prior ? ctx.seen?.get(id) : undefined;
+        if (prior && seenVersion !== undefined && seenVersion !== prior.version) stale.push(`${prior.name} (${id})`);
+      }
+      if (stale.length) {
+        throw new ValidationError(
+          `changed in another storyline since you read them: ${stale.join(', ')}. Re-read them with read_records and save again, reusing your existing check_ids.`,
+        );
+      }
+      checkClockWindow(db, campaign, plan, ctx.actorCharacterId ?? null);
+      checkTurnHandback(db, campaign.id, plan, ctx.actorCharacterId ?? null, (JSON.parse(turn.rolls_json) as unknown[]).length > 0);
+      checkFightMap(db, campaign.id, plan, ctx.actorCharacterId ?? null);
+    }
     const applied = writeBatch(db, ctx.campaignId, plan);
     const revision = campaign.revision + 1;
     db.prepare('UPDATE campaigns SET revision = ?, updated_at = ? WHERE id = ?').run(revision, nowIso(), ctx.campaignId);
@@ -551,4 +578,104 @@ export function commitTurn(
     );
     return { revision, created: applied.created };
   })();
+}
+
+/**
+ * Shared world clock: when a play turn advances its storyline's `time_min`, it may not run more
+ * than the campaign's sync window ahead of the other active storylines. Long actions are narrated
+ * as under way (`busy_until_min`) and complete when the rest of the world catches up.
+ */
+function checkClockWindow(db: Db, campaign: CampaignRow, plan: ReturnType<typeof planBatch>, actorCharacterId: string | null): void {
+  if (!actorCharacterId) return;
+  let scene: { id: string; name: string; time: number | null; prior: number | null } | null = null;
+  for (const [id, s] of plan.after) {
+    if (s.kind !== 'scene' || s.archived_at) continue;
+    const ids = Array.isArray(s.data.participants_ids) ? s.data.participants_ids : [];
+    if (!ids.includes(actorCharacterId) || (s.data.status !== undefined && s.data.status !== 'active')) continue;
+    const prior = plan.before.get(id);
+    const priorTime = prior ? (JSON.parse(prior.data_json) as { time_min?: unknown }).time_min : null;
+    scene = {
+      id,
+      name: s.name,
+      time: typeof s.data.time_min === 'number' ? s.data.time_min : null,
+      prior: typeof priorTime === 'number' ? priorTime : null,
+    };
+  }
+  if (!scene || scene.time === null || (scene.prior !== null && scene.time <= scene.prior)) return;
+  const others = worldClock(db, campaign.id, { excludeSceneId: scene.id });
+  if (others === null) return;
+  const window = syncWindow(parseConfig(campaign));
+  const limit = others + window;
+  if (scene.time > limit) {
+    throw new ValidationError(
+      `shared world clock: ${scene.name} would reach ${formatClock(scene.time)}, more than ${window} in-world minutes ahead of the other active storylines (slowest at ${formatClock(others)}). ` +
+        `Keep time_min at or below ${limit} (${formatClock(limit)}); narrate the long action as under way, set data.busy_until_min = ${scene.time} on the scene, and stop. It completes when the rest of the world catches up.`,
+    );
+  }
+}
+
+/**
+ * Players never trigger NPC turns, so a play turn may not end with an NPC's turn pending in the
+ * acting character's own scene: the GM must resolve those NPC turns in the same reply and hand the
+ * turn to a player character (or clear turn_of_id when the fight is over).
+ */
+/**
+ * A fight in the acting character's storyline needs a battle map, with every visible combatant
+ * placed, so maps and illustrations show where everyone actually is.
+ */
+function checkFightMap(db: Db, campaignId: string, plan: ReturnType<typeof planBatch>, actorCharacterId: string | null): void {
+  if (!actorCharacterId) return;
+  const rows = db.prepare(`SELECT * FROM records WHERE campaign_id = ? AND kind = 'scene' AND archived_at IS NULL`).all(campaignId) as RecordRow[];
+  const scenes = new Map(rows.map((r) => [r.id, { name: r.name, data: JSON.parse(r.data_json) as Record<string, unknown>, gm: JSON.parse(r.gm_notes_json || '{}') as Record<string, unknown> }]));
+  for (const [id, st] of plan.after) if (st.kind === 'scene') scenes.set(id, { name: st.name, data: st.archived_at ? { status: 'ended' } : st.data, gm: st.gm_notes });
+  for (const [, s] of scenes) {
+    const d = s.data;
+    if ((d.status !== undefined && d.status !== 'active') || !Array.isArray(d.participants_ids) || !d.participants_ids.includes(actorCharacterId)) continue;
+    const order = Array.isArray(d.initiative) ? (d.initiative as unknown[]).map((e) => (typeof e === 'string' ? e : (e as { id?: unknown } | null)?.id)).filter((x): x is string => typeof x === 'string') : [];
+    if (order.length < 2) continue;
+    if (!d.map || typeof d.map !== 'object') {
+      throw new ValidationError(
+        `${s.name} has a fight (initiative) but no battle map. In this same save, set data.map {cols, rows, cell_ft: 5, features: [walls, doors, furniture, cover]} for the place, and data.positions {<id>: {x, y}} for every visible combatant (hidden ones in gm_notes.positions), consistent with the narration so far.`,
+      );
+    }
+    const placed = new Set([...Object.keys((d.positions as object | undefined) ?? {}), ...Object.keys((s.gm.positions as object | undefined) ?? {})]);
+    const missing = order.filter((id) => !placed.has(id));
+    if (missing.length) throw new ValidationError(`${s.name}: every combatant needs a position on the battle map; place ${missing.join(', ')} in data.positions (or gm_notes.positions if hidden) in this save.`);
+  }
+}
+
+function checkTurnHandback(db: Db, campaignId: string, plan: ReturnType<typeof planBatch>, actorCharacterId: string | null, actorRolled: boolean): void {
+  if (!actorCharacterId) return;
+  const pcs = new Set(playerCharacterOwners(db, campaignId).keys());
+  const scenes = new Map<string, { name: string; data: Record<string, unknown> }>();
+  for (const row of db.prepare(`SELECT * FROM records WHERE campaign_id = ? AND kind = 'scene' AND archived_at IS NULL`).all(campaignId) as RecordRow[]) {
+    scenes.set(row.id, { name: row.name, data: JSON.parse(row.data_json) as Record<string, unknown> });
+  }
+  for (const [id, s] of plan.after) if (s.kind === 'scene') scenes.set(id, { name: s.name, data: s.archived_at ? { status: 'ended' } : s.data });
+  for (const [, s] of scenes) {
+    const d = s.data;
+    if (d.status !== undefined && d.status !== 'active') continue;
+    const ids = Array.isArray(d.participants_ids) ? d.participants_ids : [];
+    if (!ids.includes(actorCharacterId)) continue;
+    // An action that rolled dice used the actor's turn: initiative must move on (round or turn),
+    // otherwise the NPCs who act between this player and the next were silently skipped.
+    const initiative = Array.isArray(d.initiative) ? d.initiative : [];
+    // Compare with the scene as it was before this batch (unchanged scenes compare with themselves).
+    const sceneId = [...scenes.keys()].find((k) => scenes.get(k) === s) ?? '';
+    const prior = plan.before.get(sceneId) ?? (plan.after.has(sceneId) ? undefined : getRecord(db, campaignId, sceneId));
+    if (actorRolled && prior && initiative.length > 1 && d.turn_of_id === actorCharacterId) {
+      const was = JSON.parse(prior.data_json) as { turn_of_id?: unknown; round?: unknown };
+      if (was.turn_of_id === actorCharacterId && was.round === d.round) {
+        throw new ValidationError(
+          `${s.name}: it is still ${actorCharacterId}'s turn in the same round after an action that used their turn. Advance the initiative: resolve every NPC turn that comes next in order (roll, apply, narrate in this reply), update round if it wrapped, and set turn_of_id to the next player character.`,
+        );
+      }
+    }
+    const turnOf = d.turn_of_id;
+    if (typeof turnOf !== 'string' || !turnOf || pcs.has(turnOf)) continue;
+    const npc = plan.after.get(turnOf)?.name ?? (db.prepare('SELECT name FROM records WHERE campaign_id = ? AND id = ?').get(campaignId, turnOf) as { name: string } | undefined)?.name ?? turnOf;
+    throw new ValidationError(
+      `${s.name}: turn_of_id is ${npc} (${turnOf}), a non-player. Players never trigger NPC turns: resolve ${npc}'s turn (and any other NPC turns before the next player character) in THIS reply — roll, apply results, narrate — then set turn_of_id to the next player character, or remove turn_of_id if the fight is over.`,
+    );
+  }
 }

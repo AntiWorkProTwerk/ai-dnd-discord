@@ -5,3 +5,4 @@ data/
 *.log
 evals/reports/
 coverage/
+__pycache__/

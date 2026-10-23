@@ -10,8 +10,11 @@ import { Semaphore, effectiveBudget } from '../src/agent.js';
 import { createCampaign, setLifecycle, WorkflowError } from '../src/campaign.js';
 import { loadConfig } from '../src/config.js';
 import { acquireInstanceLock, getCampaignByChannel, getMember, openDatabase, parseConfig, projectRoot } from '../src/database.js';
-import { configureLog } from '../src/log.js';
+import { configureLog, configureLogFile } from '../src/log.js';
 import { createProvider } from '../src/providers.js';
+import { createDioramaRenderer, loadDioramaConfig } from '../src/diorama.js';
+import { createWorkshopGenerator, ImageQueue, loadImageConfig } from '../src/images.js';
+import { exec } from 'node:child_process';
 import { renderSheet, renderUsage } from '../src/render.js';
 import { seedSamplePack } from '../src/sample.js';
 import { TurnRunner, type Button, type DeliveryPort, type DeliveryTarget, type OutboundMessage } from '../src/turns.js';
@@ -26,7 +29,8 @@ const dataDir = path.resolve(process.env.LOCAL_DATA_DIR ?? path.join(projectRoot
 if (argv.includes('--fresh')) fs.rmSync(dataDir, { recursive: true, force: true });
 
 const config = loadConfig({ ...process.env, DATA_DIR: dataDir, DATABASE_PATH: path.join(dataDir, 'rpg.sqlite') });
-configureLog('warn', []);
+configureLog('info', []);
+configureLogFile(path.join(dataDir, 'logs'));
 const releaseLock = acquireInstanceLock(dataDir);
 const db = openDatabase(config.databasePath);
 const provider = createProvider(config);
@@ -39,7 +43,11 @@ function show(message: OutboundMessage, ephemeral: boolean): void {
     .replace(/\*\*(.+?)\*\*/g, `${C.bold}$1${C.reset}`)
     .replace(/^-# (.*)$/gm, `${C.dim}  $1${C.reset}`);
   console.log(`\n${ephemeral ? `${C.dim}(private)${C.reset} ` : ''}${text}`);
-  if (message.file) console.log(`${C.dim}--- ${message.file.name} ---${C.reset}\n${message.file.content}`);
+  if (message.file?.path) {
+    console.log(`${C.dim}image saved: ${message.file.path}${C.reset}`);
+    // Open with the default Windows image viewer.
+    if (process.platform === 'win32' && !process.env.LOCAL_NO_OPEN) exec(`start "" "${message.file.path}"`);
+  } else if (message.file) console.log(`${C.dim}--- ${message.file.name} ---${C.reset}\n${message.file.content}`);
   if (message.buttons?.length) {
     buttons = message.buttons;
     console.log(message.buttons.map((b, i) => `${C.yellow}[${i + 1}] ${b.label}${C.reset}`).join('   '));
@@ -52,7 +60,19 @@ const delivery: DeliveryPort = {
     return `local-${Date.now()}`;
   },
 };
-const runner = new TurnRunner({ db, config, provider, delivery, modelLimiter: new Semaphore(1) });
+const imageConfig = loadImageConfig();
+const dioramaConfig = loadDioramaConfig();
+// Paintings and dioramas share one GPU queue: one heavy job at a time.
+const gpuQueue = new ImageQueue(imageConfig.maxQueue);
+const runner = new TurnRunner({
+  db,
+  config,
+  provider,
+  delivery,
+  modelLimiter: new Semaphore(1),
+  images: imageConfig.enabled ? { generator: createWorkshopGenerator(imageConfig), queue: gpuQueue, config: imageConfig } : undefined,
+  diorama: dioramaConfig.enabled ? { renderer: createDioramaRenderer(dioramaConfig), queue: gpuQueue } : undefined,
+});
 
 let campaign = getCampaignByChannel(db, GUILD, CHANNEL);
 if (!campaign) {
@@ -100,6 +120,26 @@ async function handle(line: string): Promise<boolean> {
     if (!b) return void console.log('No such button.'), true;
     const [, kind, id, nonce] = b.customId.split(':');
     buttons = [];
+    if (kind === 'map') {
+      console.log(await runner.postMap(Number(id), campaign.id));
+      return true;
+    }
+    if (kind === 'dio') {
+      const r = runner.diorama(Number(id), campaign.id);
+      console.log(r.message);
+      if (r.done) await r.done;
+      return true;
+    }
+    if (kind === 'say') {
+      console.log('Type your reply as: character <text>');
+      return true;
+    }
+    if (kind === 'img') {
+      const r = runner.illustrate(Number(id), campaign.id);
+      console.log(r.message);
+      if (r.done) await r.done;
+      return true;
+    }
     console.log(await runner.confirm({ kind: kind!, turnId: Number(id), nonce: nonce!, userId: user, campaign, target: target(true) }));
     await runner.idle();
     return true;

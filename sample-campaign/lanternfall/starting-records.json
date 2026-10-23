@@ -57,7 +57,7 @@
     "visibility": "public",
     "path": null,
     "value_json": null,
-    "data_json": "{\"status\":\"active\",\"participants_ids\":[\"$odile\",\"$marrow\"],\"initiative\":[],\"turn_of_id\":null,\"round\":0,\"time\":\"Day 1 (14 Rainmonth), dusk\",\"pending_decision\":\"Keeper Odile Fenn has invited the characters to her table to hear an offer.\"}",
+    "data_json": "{\"status\":\"active\",\"participants_ids\":[\"$odile\",\"$marrow\"],\"initiative\":[],\"turn_of_id\":null,\"round\":0,\"time\":\"Day 1 (14 Rainmonth), dusk\",\"pending_decision\":\"Keeper Odile Fenn has invited the characters to her table to hear an offer.\",\"main\":true,\"time_min\":1080}",
     "gm_notes_json": null,
     "expected_json": null,
     "expected_version": null,

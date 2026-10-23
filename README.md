@@ -44,14 +44,19 @@ Bot permissions:
 |---|---|---|
 | View Channels | 1024 | See the campaign channel |
 | Send Messages | 2048 | Public notices, and public replies when an interaction token has expired |
-| Attach Files | 32768 | Long configuration drafts are sent as a `configuration-draft.md` attachment |
-| Send Messages in Threads | 274877906944 | Lets you run a campaign inside a thread |
+| Embed Links | 16384 | Link previews in channel posts |
+| Attach Files | 32768 | Scene illustrations and long configuration drafts (`configuration-draft.md`) |
+| Create Public Threads | 34359738368 | A thread for each side storyline |
+| Create Private Threads | 68719476736 | Private side storylines (`/rpg play private:true`) |
+| Send Messages in Threads | 274877906944 | Posting in storyline threads |
 
-Total: `1024 + 2048 + 32768 + 274877906944 = 274877942784`
+Total: `1024 + 2048 + 16384 + 32768 + 34359738368 + 68719476736 + 274877906944 = 377957174272`
 
 ```text
-https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot+applications.commands&permissions=274877942784
+https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot+applications.commands&permissions=377957174272
 ```
+
+If the bot is already in your server, either open this link again to update its permissions, or add the two thread permissions to the bot's role.
 
 Replace `CLIENT_ID` with your Application ID and open the URL.
 
@@ -201,10 +206,13 @@ Confirmation buttons expire after `CONFIRMATION_TTL_MINUTES` (corrections, undo)
 | `/rpg import` | Owner | Private | No (approval may trigger a config draft) | Upload rules/setting/adventure for review |
 | `/rpg configure` | Owner | Private | Yes | Draft a configuration change for review |
 | `/rpg start` / `pause` / `resume` | Owner | Private acknowledgement + public notice | No | Campaign lifecycle. `play` only works while active |
-| `/rpg character` | Any member without a character | Private (owner approval request is public) | Yes | Conversational character creation |
-| `/rpg play` | Players with a character | **Public** | Yes | Main game action |
+| `/rpg character` | Any member without a character; the owner can create several | Private (owner approval request is public) | Yes | Conversational character creation |
+| `/rpg play` | Players with a character | **Public** | Yes | Main game action. `as:` picks which of your characters acts |
 | `/rpg ask` | Anyone in the channel | Private | Yes | Read-only question. No dice, no writes, player-visible data only |
-| `/rpg sheet` | Players | Private | No | Your sheet and inventory from the database, without GM notes |
+| `/rpg sheet` | Players | Private | No | Your sheet and inventory from the database, without GM notes. `as:` picks the character |
+| `/rpg map` | Players | Public map, private acknowledgement | No | Battle map of your storyline (`as:` picks the character) |
+| `/rpg portrait` | Players | Private | No (local image) | Your character's reference portrait; `regenerate:true` paints a new one |
+| `/rpg diorama` | Players | Public | No (local Blender) | Your storyline's battle map as a 3D diorama; `turntable:true` for a rotating video |
 | `/rpg recap` | Anyone in the channel | **Public** | Only if the cached recap is stale | Recap from saved events |
 | `/rpg gm` | Owner | Private preview; public announcement on apply | Yes | Correction, clarification or world advance |
 | `/rpg undo` | Owner | Private preview; public announcement on apply | No | Revert the latest world turn |
@@ -212,6 +220,93 @@ Confirmation buttons expire after `CONFIRMATION_TTL_MINUTES` (corrections, undo)
 | `/rpg backup` | Owner | Private | No | Write a backup on the bot host |
 
 "Owner" means the campaign owner (the user who ran `/rpg setup`). `BOT_ADMIN_USER_IDS` only lets someone create campaigns. It does not give them owner rights over other people's campaigns.
+
+### Parallel storylines (several players doing different things at once)
+
+Players don't have to stay together. Each **storyline** is an ordinary active `scene` record whose `participants_ids` lists the characters in it, and different storylines are played **at the same time**, like a live MMO.
+
+- **The main story** lives in the campaign channel. When a character goes off on their own ("I leave the inn and ride for the marshes"), the GM starts a new storyline for them. The bot opens a **thread** for it under the channel, posts a "↪ continues in #thread" pointer, and from then on that player's actions resolve and post there. `/rpg play` works in the thread or in the main channel; from the main channel it posts a pointer and continues in the thread.
+- **Private side stories:** `/rpg play private:true` asks the GM to play that action in your own new private storyline (even if it would not otherwise split off), in a private thread visible only to its players, the owner and server moderators. Its first reply already goes to that thread, not the main channel.
+- **Threads never disappear.** They auto-archive after 7 days of quiet, stay readable, and reopen when posted to. When a storyline ends or rejoins another (characters meet, someone joins the fight), its thread gets a closing line and is archived.
+- **Live and consistent at the same time:**
+  - Actions in one storyline resolve in order, because turn order matters there. Different storylines resolve concurrently.
+  - Conflicts are checked per record. If two storylines change the same NPC at the same moment, the second save is rejected, and the GM re-reads and retries with the same dice. Nothing is overwritten.
+  - A character can be in only one active storyline. The GM sees its own storyline in full and the others as read-only context, so facts stay consistent across them.
+- **Turn order is enforced by the server.** In the acting player's fight, a save may not end with an NPC's turn pending, or skip the NPCs after a player used their turn. The GM must play those NPC turns in the same reply. Characters who aren't in a fight are never blocked by its turn order.
+- **Shared world clock:**
+  - Every scene keeps `time_min` (in-world minutes since Day 1, 00:00). A storyline may run at most `time_sync_window_minutes` ahead of the slowest active storyline. The default is 60; change it with `/rpg configure`.
+  - Longer actions (a three-day journey) are narrated as under way (`busy_until_min`). When the rest of the world catches up, the bot posts "⏳ … can now finish" in that storyline.
+  - Storylines idle for 30 real minutes don't hold the clock back. The owner can move the world forward with `/rpg gm text: advance the world to dawn`.
+- **Testing it alone:** the campaign owner can control several characters. Each `/rpg character` conversation creates another one (names must be unique), then act as each one with `/rpg play as:<name> text: …` (the `as` box autocompletes your characters). The character you pick stays your active one until you pick another. Other players still control one character each, and nobody can act as a character they don't control.
+- Each GM reply starts with a small storyline header, for example `📍 Brawl at the Tallow and Tide · round 2 · Day 1, 18:40`.
+
+### Battle maps (free, exact, no AI)
+
+The GM keeps track of where everyone stands. When a fight starts, or position matters (a chase, sneaking past a guard, a trap), it gives the scene a grid:
+- **`data.map`:** `{cols, rows, cell_ft, features: [{kind, label, x, y, w, h}]}`. Feature kinds are wall, door, cover, difficult, water, pit, object, stairs and light.
+- **`data.positions`:** `{<record id>: {x, y, size}}`.
+
+The GM moves tokens in the same save as the action and sees a text version of the map, with distances, in its context.
+
+The server checks every save:
+- everything stays inside the grid;
+- one creature per cell, nobody inside a wall;
+- only the scene's participants are placed;
+- a character is placed in only one scene.
+
+Hidden creatures and secret terrain live in the scene's `gm_notes` and are never drawn.
+
+To see the map (rendered locally as a top-down tactical grid with tokens, a legend, wounded and down markers, and a gold ring for whose turn it is):
+- `/rpg play map:true text: …` posts the map right after the reply.
+- The **🗺️ Map** button under a reply shows the map as it was at that moment.
+- `/rpg map` (optional `as:`) posts your storyline's current map, in its thread for side stories.
+
+### 3D dioramas (optional, free)
+
+With `DIORAMA=on`, your local Blender (`BLENDER_PATH`, or the path in the 3D pipeline's config) builds the battle map as a tabletop diorama:
+- walls and furniture as blocks, with the walls in front of the figures cut away;
+- a figure on a base for each token, in its map color;
+- fallen figures lying down, and a gold base for whoever's turn it is.
+
+It renders in about 3-15 seconds, positions are exact, and no AI is involved, so there are no extra hands.
+
+To see one:
+- **🧊 Diorama** under a reply (shown when the reply has a battle map) builds that moment.
+- `/rpg play diorama:true` builds it automatically after the reply.
+- `/rpg diorama` (optional `as:`) builds the current map. `turntable:true` posts a short rotating video (48 frames, H.264, about 300 KB) instead of a still.
+
+Dioramas share the painting queue and the pipeline's GPU lock, so only one heavy job runs at a time. ComfyUI's models are unloaded first when it is idle. `DIORAMA_ENGINE=workbench` gives flat, faster renders.
+
+Discord has no native 3D model viewer. An interactive 3D view would need a Discord Activity (an embedded web app on a public HTTPS host), which isn't built.
+
+### Scene illustrations (optional, free)
+
+With `IMAGE_GENERATION=comfy`, every GM reply in the channel gets a **🎨 Illustrate** button, and `/rpg play` takes an optional `illustrate:true` that paints the scene automatically. Anyone at the table can press the button. The picture is posted as a reply to the scene it shows and saved under `DATA_DIR/images/`. Images never change the game.
+
+Generation runs entirely on your own GPU through the local 2D asset workshop (`IMAGE_PIPELINE_ROOT`, default `D:/Godot/local-2d-pipeline`). `scripts/comfy_image.py` is run with the workshop's own Python and reuses the workshop's code:
+- the shared GPU lock,
+- the offline ComfyUI launcher (API and custom nodes disabled),
+- the pinned FLUX.2 Klein text-to-image graph,
+- the audited node allowlist.
+
+No paid or remote model is used, and the image prompt is built without any model call. On this machine the first image after ComfyUI starts took about 70 seconds; later ones took about 5 seconds at 1024×576.
+
+- **Spoiler safety:** prompts use only the public narration, the acting character's public look and the public location. GM notes and hidden records are never read. Quoted dialogue and known names are left out, because FLUX tends to paint them as garbled lettering.
+- **One at a time:** images are queued one at a time, with a backlog of `IMAGE_MAX_QUEUE`. If another pipeline job (3D, Blender, 2D) holds the GPU lock, the bot retries for about 45 seconds, then posts "the GPU is busy" and the button can be pressed again later.
+- **Local only:** this only works on the machine that has the pipeline. Everywhere else, leave `IMAGE_GENERATION=off` and the button is hidden.
+
+**Consistent characters (portraits).**
+- **When portraits are painted:** every character gets a full-body portrait once, in the background, when it is accepted. A missing one is painted the first time the character appears in an illustration.
+- **What a portrait is built from:** the sheet's public `appearance` and gear. The GM now always records `appearance` (sex, age, build, hair, face, clothing) for new characters. For an older character, add one with `/rpg gm text: give Thaniesh an appearance: a lean male night elf with a dark braid…`.
+- **Where they are stored:** `DATA_DIR/images/<campaign>/portraits/`. A portrait is repainted when the appearance or gear changes, or when the file is missing (backups don't include images).
+- **Viewing one:** `/rpg portrait` (optional `as:`) shows yours; `regenerate:true` paints a new one.
+
+**How 🎨 Illustrate uses portraits and the map.**
+- **Focus:** at most three people: the actor, whose turn it is, then those named or nearest on the battle map. Everyone else is a background figure.
+- **References:** up to two player-character portraits are passed to FLUX.2 as reference images, so faces and outfits stay the same from picture to picture. With more references, the model started swapping features between people.
+- **Positions:** where people stand comes from the battle map, written as text (foreground or background, left or right, next to whom, by the bar). In tests, a guide image with colored or grey figures leaked into the painting.
+- **Fallback:** if the reference run fails, the picture is painted from text alone.
+- **Turning it off:** set `IMAGE_REFERENCES=off` to go back to text-only pictures.
 
 ## 5. Owner tools
 
@@ -264,7 +359,17 @@ How spending is controlled (paid provider only):
 
 ## 7. Inspecting failures
 
-Start with `/rpg usage`. It lists the five most recent `aborted` / `needs_attention` turns and their errors. For more detail, open the database. Every request is a row in `turns`.
+Start with `/rpg usage`. It lists the five most recent `aborted` / `needs_attention` turns and their errors.
+
+The bot also writes a daily log file, `DATA_DIR/logs/bot-YYYY-MM-DD.log`, kept for 14 days. It records:
+- every command and button press (Discord user ID, name and text),
+- every turn's outcome (status, model calls, cost, seconds, error),
+- every image (time, file and prompt),
+- delivery problems.
+
+Lines are redacted like the console, so the bot token and API key are never written. Player text is included, so treat the logs as private.
+
+For more detail, open the database. Every request is a row in `turns`.
 
 ### Turn statuses
 

@@ -66,6 +66,8 @@ export interface CampaignConfig {
   starting_situation: string;
   constraints: Constraint[];
   model: { reasoning_effort: string | null };
+  /** Shared world clock: how far (in-world minutes) one storyline may run ahead of the others. */
+  time_sync_window_minutes?: number;
   budget: { monthly_usd: number | null; max_turn_usd: number | null };
 }
 
@@ -85,7 +87,10 @@ export interface CampaignRow {
 export interface MemberRow {
   campaign_id: string;
   discord_user_id: string;
+  /** The active character (used when a command does not name one). */
   character_record_id: string | null;
+  /** JSON array of every character this member controls. */
+  character_ids_json: string;
   role: 'owner' | 'player';
   created_at: string;
 }
@@ -129,6 +134,8 @@ export interface TurnRow {
   expires_at: string | null;
   committed_revision: number | null;
   reverted_by_turn_id: number | null;
+  /** Storyline (active scene record) the turn was played in; null outside play. */
+  scene_id: string | null;
   attempts: number;
   error: string | null;
   created_at: string;
@@ -188,6 +195,8 @@ export interface ToolContext {
   view: 'gm' | 'player';
   /** Owner reviewing imports may search pending sources. */
   includePendingSources: boolean;
+  /** Record versions the model has seen this turn (context + read_records), for conflict checks. */
+  seen?: Map<string, number>;
   /** Draft modes validate save_turn but store a proposal instead of committing. */
   saveMode: 'commit' | 'draft' | 'none';
   allowDice: boolean;

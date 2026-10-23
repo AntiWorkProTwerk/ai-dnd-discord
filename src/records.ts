@@ -1,7 +1,8 @@
 // The one transactional write path for world records. Operations are data operations (create,
 // set, remove, add, move, archive), never RPG actions. A batch is planned against a candidate
 // copy of the affected records and either applied completely or not at all.
-import { getRecord, newRecordId, nowIso, type Db } from './database.js';
+import { playerCharacterOwners, getRecord, newRecordId, nowIso, type Db } from './database.js';
+import { mapProblems, type MapSceneState } from './maps.js';
 import type { Constraint, RecordRow, Visibility } from './types.js';
 import {
   assertSafeJson,
@@ -333,6 +334,19 @@ export function planBatch(db: Db, rawOps: RawOperation[], opts: BatchOptions): P
         errors.push(err instanceof Error ? err.message : String(err));
       }
     }
+    if ([...after.values()].some((s) => s.kind === 'scene')) {
+      const scenes = activeSceneStates(db, opts.campaignId, after);
+      const overlap = storylineOverlap(db, opts.campaignId, scenes);
+      if (overlap) errors.push(overlap);
+      const changed = new Set([...after.values()].filter((s) => s.kind === 'scene').map((s) => s.id));
+      const info = (id: string) => {
+        const st = after.get(id);
+        if (st) return { kind: st.kind, visibility: st.visibility, archived: !!st.archived_at };
+        const row = getRecord(db, opts.campaignId, id);
+        return row ? { kind: row.kind, visibility: row.visibility, archived: !!row.archived_at } : undefined;
+      };
+      errors.push(...mapProblems(scenes, changed, info));
+    }
   }
   if (errors.length) throw new ValidationError(errors.slice(0, 12).join('\n'));
 
@@ -566,4 +580,32 @@ export function constraintViolations(db: Db, campaignId: string, constraints: Co
 
 export function cloneState(s: RecordState): RecordState {
   return clone(s);
+}
+
+/**
+ * Storyline invariant: a player character may be a participant of at most one active scene, so
+ * every action routes to exactly one storyline. Returns an actionable error or null.
+ */
+/** Every active, unarchived scene as it will be after the batch. */
+function activeSceneStates(db: Db, campaignId: string, after: Map<string, RecordState>): MapSceneState[] {
+  const scenes = new Map<string, MapSceneState & { archived: boolean }>();
+  for (const row of db.prepare(`SELECT * FROM records WHERE campaign_id = ? AND kind = 'scene'`).all(campaignId) as RecordRow[]) {
+    scenes.set(row.id, { id: row.id, name: row.name, archived: !!row.archived_at, data: JSON.parse(row.data_json) as Record<string, unknown>, gm_notes: JSON.parse(row.gm_notes_json || '{}') as Record<string, unknown> });
+  }
+  for (const [id, s] of after) if (s.kind === 'scene') scenes.set(id, { id, name: s.name, archived: !!s.archived_at, data: s.data, gm_notes: s.gm_notes });
+  return [...scenes.values()].filter((s) => !s.archived && (s.data.status === undefined || s.data.status === 'active'));
+}
+
+function storylineOverlap(db: Db, campaignId: string, scenes: MapSceneState[]): string | null {
+  const pcs = new Set(playerCharacterOwners(db, campaignId).keys());
+  const where = new Map<string, string[]>();
+  for (const s of scenes) {
+    const ids = Array.isArray(s.data.participants_ids) ? s.data.participants_ids : [];
+    for (const p of ids) if (typeof p === 'string' && pcs.has(p)) where.set(p, [...(where.get(p) ?? []), s.name]);
+  }
+  const doubled = [...where].filter(([, names]) => names.length > 1);
+  if (!doubled.length) return null;
+  return `a player character can be in only one active scene (storyline): ${doubled
+    .map(([pc, names]) => `${pc} is in ${names.join(' and ')}`)
+    .join('; ')}. Remove them from the scene they left (or end that scene) in the same batch.`;
 }

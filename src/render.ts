@@ -1,9 +1,10 @@
 // Text rendering for Discord. Player-facing renderers read only data a player may see: no
 // gm_notes, no gm-visibility records, no other players' private records, no raw tool output.
-import { getRecord, listMembers, monthUsage, parseConfig, type Db } from './database.js';
+import { getRecord, listMembers, memberCharacterIds, monthUsage, parseConfig, type Db } from './database.js';
 import { formatRoll, type RollRecord } from './dice.js';
 import type { Diff } from './records.js';
 import { playerCanSee } from './tools.js';
+import { formatClock, sceneData, timeMin } from './storylines.js';
 import type { CampaignRow, RecordRow, TurnRow } from './types.js';
 
 export const DISCORD_LIMIT = 2000;
@@ -44,13 +45,17 @@ function nameOf(db: Db, campaignId: string, id: unknown): string {
 }
 
 /** Mechanical receipts generated from accepted deltas and public rolls, not from the narration. */
+const SCENE_BOOKKEEPING = /^(participants_ids|initiative|positions|map|pending_decision|turn_of_id|round|time_min|time|busy_until_min|status|main|private)(.|$)/;
+
 export function receipts(db: Db, turn: TurnRow): string[] {
   const lines: string[] = [];
   const rolls = JSON.parse(turn.rolls_json) as RollRecord[];
   const changes = JSON.parse(turn.changes_json ?? '{}') as { diffs?: Diff[]; roll_ids?: string[] };
   const used = new Set(changes.roll_ids ?? rolls.map((r) => r.check_id));
   for (const r of rolls) if (r.visibility === 'public' && used.has(r.check_id)) lines.push(formatRoll(r));
-  const diffs = (changes.diffs ?? []).filter((d) => !d.hidden);
+  // Scene bookkeeping (participants, initiative, map positions, clock) is shown by the storyline
+  // header and the battle map, not as raw changes.
+  const diffs = (changes.diffs ?? []).filter((d) => !d.hidden && !(d.kind === 'scene' && SCENE_BOOKKEEPING.test(d.field.replace(/^data./, ''))));
   for (const d of diffs.slice(0, 10)) {
     if (d.field === 'created') lines.push(`➕ ${d.name} (${d.kind})`);
     else if (d.field === 'archived') lines.push(`✖ ${d.name} removed`);
@@ -63,11 +68,26 @@ export function receipts(db: Db, turn: TurnRow): string[] {
 
 export function renderPlay(db: Db, turn: TurnRow): string[] {
   const who = turn.actor_character_id ? (getRecord(db, turn.campaign_id, turn.actor_character_id)?.name ?? 'Someone') : 'Someone';
-  const head = `**${sanitize(who)}:** ${sanitize(clip(turn.input_text, 400))}`;
+  const head = `**${sanitize(who)}:** ${sanitize(clip(turn.input_text, 1500))}`;
   const body = sanitize(turn.public_reply ?? '');
   const rec = receipts(db, turn);
-  const text = [head, '', body, ...(rec.length ? ['', ...rec.map((l) => `-# ${sanitize(l)}`)] : [])].join('\n');
+  const story = storylineLabel(db, turn);
+  const text = [...(story ? [`-# ${story}`] : []), head, '', body, ...(rec.length ? ['', ...rec.map((l) => `-# ${sanitize(l)}`)] : [])].join('\n');
   return splitMessage(text);
+}
+
+/** "📍 Brawl at the Tallow and Tide · round 2 · Day 1, 18:40" for the storyline a turn was played in. */
+export function storylineLabel(db: Db, turn: TurnRow): string | null {
+  if (!turn.scene_id) return null;
+  const scene = getRecord(db, turn.campaign_id, turn.scene_id);
+  if (!scene || scene.visibility === 'gm') return null;
+  const d = sceneData(scene);
+  const parts = [`📍 ${sanitize(scene.name)}`];
+  if (typeof d.round === 'number' && d.round > 0) parts.push(`round ${d.round}`);
+  const t = timeMin(scene);
+  if (t !== null) parts.push(formatClock(t));
+  else if (typeof d.time === 'string') parts.push(sanitize(d.time).slice(0, 60));
+  return parts.join(' · ');
 }
 
 function formatValue(v: unknown, indent = ''): string {
@@ -91,12 +111,17 @@ function formatValue(v: unknown, indent = ''): string {
 }
 
 /** Direct database rendering of a player's own sheet and inventory (no model call). */
-export function renderSheet(db: Db, campaign: CampaignRow, userId: string): string {
+export function renderSheet(db: Db, campaign: CampaignRow, userId: string, characterId?: string): string {
   const member = listMembers(db, campaign.id).find((m) => m.discord_user_id === userId);
   if (!member?.character_record_id) return 'You have no character in this campaign yet. Use `/rpg character` to create one.';
-  const ch = getRecord(db, campaign.id, member.character_record_id);
+  const ch = getRecord(db, campaign.id, characterId ?? member.character_record_id);
   if (!ch) return 'Your character record is missing; ask the owner.';
   const lines = [`**${sanitize(ch.name)}**${ch.archived_at ? ' _(retired)_' : ''}`];
+  const owned = memberCharacterIds(member);
+  if (owned.length > 1) {
+    const names = owned.map((id) => `${sanitize(getRecord(db, campaign.id, id)?.name ?? id)}${id === member.character_record_id ? ' (active)' : ''}`);
+    lines.push(`-# You control: ${names.join(', ')}. Pick one with the \`as\` option.`);
+  }
   const location = ch.parent_id ? getRecord(db, campaign.id, ch.parent_id) : undefined;
   if (location && playerCanSee(location, userId)) lines.push(`Location: ${sanitize(location.name)}`);
   const data = JSON.parse(ch.data_json) as Record<string, unknown>;
