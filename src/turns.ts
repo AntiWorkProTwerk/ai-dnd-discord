@@ -47,8 +47,8 @@ import type { RollRecord } from './dice.js';
 import { log } from './log.js';
 import type { ModelProvider } from './providers.js';
 import type { Diff } from './records.js';
-import { buildPortraitPrompt, currentPortrait, PORTRAIT_SIZE, portraitFor, portraitHash, portraitPathFor, savePortrait, type PortraitInfo } from './portraits.js';
-import { dioramaPathFor, type DioramaRenderer } from './diorama.js';
+import { buildPortraitPrompt, currentMiniature, currentPortrait, miniaturePathFor, PORTRAIT_SIZE, portraitFor, portraitHash, portraitPathFor, savePortrait, type PortraitInfo } from './portraits.js';
+import { dioramaPathFor, type DioramaRenderer, type MiniatureBuilder } from './diorama.js';
 import { mapPathFor, mapSnapshot, writeMapPng, type MapSnapshot } from './maps.js';
 import { activeScenes, isMain, mainScene, participants, sceneData, saveThread, storylineKey, storylineOf, threadFor, worldClock } from './storylines.js';
 import { buildScenePlan, buildScenePrompt, ImageBusyError, imagePathFor, logImageError, type ImageConfig, type ImageGenerator, type ImageQueue } from './images.js';
@@ -145,7 +145,7 @@ export interface RunnerDeps {
   /** Optional local image pipeline; absent means illustrations are off. */
   images?: { generator: ImageGenerator; queue: ImageQueue; config: ImageConfig };
   /** 3D diorama renders (Blender); shares the GPU queue with paintings. */
-  diorama?: { renderer: DioramaRenderer; queue: ImageQueue };
+  diorama?: { renderer: DioramaRenderer; queue: ImageQueue; miniatures?: MiniatureBuilder };
 }
 
 const READ_ONLY: TurnMode[] = ['ask', 'recap', 'summary'];
@@ -578,7 +578,13 @@ export class TurnRunner {
             updateTurn(db, t.id, { status: 'delivered' });
             await this.announce(campaign, `🎉 **${sanitize(r.characterName ?? 'A new adventurer')}** joins the campaign!`);
             // Paint the reference portrait in the background; illustrations reuse it.
-            if (r.characterId) this.paintPortrait(campaign.id, r.characterId);
+            if (r.characterId) {
+              const characterId = r.characterId;
+              // Then its 3D miniature for dioramas (about a minute of GPU time, in the background).
+              void this.paintPortrait(campaign.id, characterId).done?.then((p) => {
+                if (p && this.deps.diorama?.miniatures) this.buildMiniature(campaign.id, characterId);
+              });
+            }
             return `Character created. Use \`/rpg sheet\` to view it${campaign.status === 'active' ? ' and `/rpg play` to act' : ''}.`;
           }
           case 'imp': {
@@ -840,7 +846,7 @@ export class TurnRunner {
     };
     const job = dio.queue.run(async () => {
       try {
-        const out = await dio.renderer.render(snapshot, dioramaPathFor(config.dataDir, t), opts.turntable ? { turntable: dioramaPathFor(config.dataDir, t, 'mp4') } : {});
+        const out = await dio.renderer.render(this.withMiniatures(t.campaign_id, snapshot), dioramaPathFor(config.dataDir, t), opts.turntable ? { turntable: dioramaPathFor(config.dataDir, t, 'mp4') } : {});
         const file = out.video ? { name: `diorama-${t.id}.mp4`, path: out.video } : { name: `diorama-${t.id}.png`, path: out.path };
         const id = await this.deps.delivery.send({ channelId, ephemeral: false }, { content: `🧊 **${sanitize(snapshot.scene_name)}**`, file, replyTo: d.message_ids?.[0] }, 0, `dio${t.id}${out.video ? 'v' : ''}`);
         setState({ status: 'done', message_id: id, path: file.path, seconds: out.seconds });
@@ -863,6 +869,55 @@ export class TurnRunner {
     return { message: `🧊 Building the diorama${opts.turntable ? ' turntable' : ''}… it will appear under the scene shortly.`, done: job };
   }
 
+  /** The snapshot with each token's 3D miniature (when one is built from its current portrait). */
+  private withMiniatures(campaignId: string, snapshot: MapSnapshot): MapSnapshot & { tokens: (MapSnapshot['tokens'][number] & { model?: string })[] } {
+    const style = this.deps.images?.config.style;
+    if (!style) return snapshot;
+    return { ...snapshot, tokens: snapshot.tokens.map((t) => ({ ...t, model: currentMiniature(this.deps.db, campaignId, t.id, style) ?? undefined })) };
+  }
+
+  /**
+   * Builds a character's 3D miniature from its portrait with the local 3D pipeline (about a
+   * minute), painting the portrait first if needed. Dioramas use it in place of a plain figure.
+   */
+  buildMiniature(campaignId: string, recordId: string, opts: { force?: boolean } = {}): { message: string; done: Promise<string | null> | null } {
+    const { db, config } = this.deps;
+    const dio = this.deps.diorama;
+    const images = this.deps.images;
+    if (!dio?.miniatures || !images) return { message: '3D miniatures need both image generation and dioramas turned on.', done: null };
+    const record = getRecord(db, campaignId, recordId);
+    if (!record || !buildPortraitPrompt(db, record, images.config.style)) return { message: 'That character cannot have a miniature.', done: null };
+    const existing = currentMiniature(db, campaignId, recordId, images.config.style);
+    if (existing && !opts.force) return { message: 'ready', done: Promise.resolve(existing) };
+    if (portraitFor(db, campaignId, recordId)?.miniature?.status === 'queued' && this.miniatureJobs.has(recordId)) {
+      return { message: `🧊 Already building ${sanitize(record.name)}'s miniature…`, done: this.miniatureJobs.get(recordId)! };
+    }
+    const setMini = (miniature: NonNullable<PortraitInfo['miniature']>) => savePortrait(db, campaignId, recordId, { miniature });
+    const builder = dio.miniatures;
+    const job = dio.queue.run(async () => {
+      try {
+        if (!currentPortrait(db, campaignId, recordId, images.config.style)) await this.paintPortraitNow(campaignId, recordId);
+        const portrait = currentPortrait(db, campaignId, recordId, images.config.style);
+        if (!portrait) throw new Error('no portrait to build from');
+        const out = miniaturePathFor(config.dataDir, campaignId, recordId);
+        const r = await builder.build(portrait.path, out, path.join(path.dirname(out), 'logs', recordId));
+        setMini({ status: 'done', path: r.path, portrait_hash: portrait.prompt_hash, seconds: r.seconds });
+        log.info('miniature', { record: recordId, name: record.name, seconds: r.seconds, path: r.path });
+        return r.path;
+      } catch (err) {
+        log.warn('miniature failed', { record: recordId, err });
+        setMini({ status: 'failed', error: String((err as Error).message).slice(0, 300) });
+        return null;
+      } finally {
+        this.miniatureJobs.delete(recordId);
+      }
+    });
+    if (!job) return { message: '🧊 The GPU queue is full; try again in a minute.', done: null };
+    setMini({ status: 'queued' });
+    this.miniatureJobs.set(recordId, job);
+    return { message: `🧊 Building ${sanitize(record.name)}'s 3D miniature (about a minute)…`, done: job };
+  }
+
   /** `/rpg diorama`: the current battle map of the caller's storyline as a 3D diorama, in its channel. */
   dioramaNow(campaign: CampaignRow, userId: string, characterId?: string, opts: { turntable?: boolean } = {}): { message: string; channelId?: string; done: Promise<unknown> | null } {
     const { db, config } = this.deps;
@@ -876,7 +931,7 @@ export class TurnRunner {
     const base = path.join(config.dataDir, 'images', campaign.id, `diorama-${scene.id}-${Date.now()}`);
     const job = dio.queue.run(async () => {
       try {
-        const out = await dio.renderer.render(snapshot, `${base}.png`, opts.turntable ? { turntable: `${base}.mp4` } : {});
+        const out = await dio.renderer.render(this.withMiniatures(campaign.id, snapshot), `${base}.png`, opts.turntable ? { turntable: `${base}.mp4` } : {});
         const file = out.video ? { name: 'diorama.mp4', path: out.video } : { name: 'diorama.png', path: out.path };
         await this.deps.delivery.send({ channelId, ephemeral: false }, { content: `🧊 **${sanitize(snapshot.scene_name)}** (current)`, file }, 0, `dionow${scene.id}${Date.now()}`);
         log.info('diorama', { scene: scene.id, seconds: out.seconds, path: file.path, by: userId });
@@ -945,6 +1000,7 @@ export class TurnRunner {
 
   private creating = new Set<string>();
   private portraitJobs = new Map<string, Promise<PortraitInfo | null>>();
+  private miniatureJobs = new Map<string, Promise<string | null>>();
 
   /**
    * After a world change: open a persistent thread for every new side storyline that has player

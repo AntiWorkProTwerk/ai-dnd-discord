@@ -275,6 +275,8 @@ To see one:
 - `/rpg play diorama:true` builds it automatically after the reply.
 - `/rpg diorama` (optional `as:`) builds the current map. `turntable:true` posts a short rotating video (48 frames, H.264, about 300 KB) instead of a still.
 
+**3D miniatures.** With both image generation and dioramas on, each player character's portrait is turned into a textured 3D miniature by the local 3D pipeline (`scripts/miniature.py` runs its pinned Pixal3D image-to-model graph). It takes about a minute, happens automatically after a new character's portrait, and is stored at `DATA_DIR/images/<campaign>/miniatures/`. Dioramas then show the miniature, standing on its base, instead of a plain figure. Use `/rpg portrait miniature:true` to build one for an existing character, and add `regenerate:true` to rebuild it. A miniature is rebuilt when the portrait changes. Fallen characters and NPCs still use plain figures.
+
 Dioramas share the painting queue and the pipeline's GPU lock, so only one heavy job runs at a time. ComfyUI's models are unloaded first when it is idle. `DIORAMA_ENGINE=workbench` gives flat, faster renders.
 
 Discord has no native 3D model viewer. An interactive 3D view would need a Discord Activity (an embedded web app on a public HTTPS host), which isn't built.

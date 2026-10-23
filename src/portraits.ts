@@ -24,6 +24,8 @@ export interface PortraitInfo {
   seconds?: number;
   error?: string;
   updated_at?: string;
+  /** 3D miniature built from this portrait by the local 3D pipeline, for dioramas. */
+  miniature?: { status: 'queued' | 'done' | 'failed'; path?: string; portrait_hash?: string; seconds?: number; error?: string };
 }
 
 export function portraitPathFor(dataDir: string, campaignId: string, recordId: string): string {
@@ -74,6 +76,17 @@ export function buildPortraitPrompt(db: Db, record: RecordRow, style: string): s
     .map((p) => p.replace(/[.\s]+$/, ''))
     .join('. ')
     .concat('.');
+}
+
+export function miniaturePathFor(dataDir: string, campaignId: string, recordId: string): string {
+  return path.join(dataDir, 'images', campaignId, 'miniatures', `${recordId}.glb`);
+}
+
+/** The miniature's GLB if it exists and was built from the record's current portrait. */
+export function currentMiniature(db: Db, campaignId: string, recordId: string, style: string): string | null {
+  const p = currentPortrait(db, campaignId, recordId, style);
+  const m = p?.miniature;
+  return p && m?.status === 'done' && m.path && m.portrait_hash === p.prompt_hash && fs.existsSync(m.path) ? m.path : null;
 }
 
 export function portraitHash(prompt: string): string {

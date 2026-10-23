@@ -48,7 +48,10 @@ let prompts: string[];
 let refsSeen: string[][];
 let fail: Error | null;
 
-function runnerWith(images = true, max = 4) {
+let built: string[];
+let rendered: { model?: string }[][];
+
+function runnerWith(images = true, max = 4, dioramas = false) {
   const config = loadConfig({ DATA_DIR: dir, LLM_PROVIDER: 'ollama' });
   delivery = new Capture();
   const generator: ImageGenerator = {
@@ -61,9 +64,33 @@ function runnerWith(images = true, max = 4) {
       return { path: out, seconds: 0.1 };
     },
   };
+  const queue = new ImageQueue(max);
+  built = [];
+  rendered = [];
   return new TurnRunner({
     db, config, provider: new OneShotProvider(), delivery, modelLimiter: new Semaphore(1),
-    images: images ? { generator, queue: new ImageQueue(max), config: loadImageConfig({ IMAGE_GENERATION: 'comfy' }) } : undefined,
+    images: images ? { generator, queue, config: loadImageConfig({ IMAGE_GENERATION: 'comfy' }) } : undefined,
+    diorama: dioramas
+      ? {
+          queue,
+          renderer: {
+            async render(snapshot, out) {
+              rendered.push((snapshot.tokens as { model?: string }[]).map((t) => ({ model: t.model })));
+              fs.mkdirSync(path.dirname(out), { recursive: true });
+              fs.writeFileSync(out, 'png');
+              return { path: out, video: null, seconds: 1 };
+            },
+          },
+          miniatures: {
+            async build(portrait, out) {
+              built.push(portrait);
+              fs.mkdirSync(path.dirname(out), { recursive: true });
+              fs.writeFileSync(out, 'glb');
+              return { path: out, seconds: 1 };
+            },
+          },
+        }
+      : undefined,
   });
 }
 
@@ -323,5 +350,40 @@ describe('scene plans', () => {
     expect(await runner.illustrate(t.id, campaign.id).done).toMatchObject({ path: expect.stringContaining(`turn-${t.id}.png`) });
     expect(calls).toBe(3); // portrait, scene with references (failed), scene without
     expect(orig.at(-1)).not.toMatch(/Image 1 shows/);
+  });
+});
+
+describe('3D miniatures', () => {
+  const pcId = () => (db.prepare(`SELECT id FROM records WHERE kind = 'character'`).get() as { id: string }).id;
+
+  it('build from the portrait once, rebuild when the portrait changes, and stand in dioramas', async () => {
+    const runner = runnerWith(true, 4, true);
+    const id = pcId();
+    const first = runner.buildMiniature(campaign.id, id);
+    expect(first.message).toMatch(/Building Borin's 3D miniature/);
+    const glb = (await first.done)!;
+    expect(glb).toContain(path.join('miniatures', `${id}.glb`));
+    expect(built).toEqual([expect.stringContaining(path.join('portraits', `${id}.png`))]); // portrait painted first
+    expect(runner.buildMiniature(campaign.id, id).message).toBe('ready');
+
+    // A battle map turn: the diorama gets the miniature for that token.
+    const room = (db.prepare(`SELECT id FROM records WHERE name = 'Cray Chapel'`).get() as { id: string }).id;
+    db.transaction(() => {
+      const plan = planBatch(db, [op({ op: 'create', ref: '$s', kind: 'scene', name: 'Chapel', parent_id: room, data_json: JSON.stringify({ status: 'active', main: true, participants_ids: [id], map: { cols: 4, rows: 4, cell_ft: 5 }, positions: { [id]: { x: 1, y: 1 } } }) })] as never, { campaignId: campaign.id, actorUserId: 'o', constraints: [] });
+      writeBatch(db, campaign.id, plan);
+    })();
+    expect(await runner.dioramaNow(getCampaign(db, campaign.id)!, 'u1').done).toBeUndefined();
+    expect(rendered.at(-1)).toEqual([{ model: glb }]);
+
+    db.prepare(`UPDATE records SET data_json = '{"appearance":"lean elf with silver hair"}' WHERE id = ?`).run(id);
+    expect(runner.buildMiniature(campaign.id, id).message).toMatch(/Building/); // stale: the look changed
+  });
+
+  it('a newly accepted character gets its portrait and then its miniature', async () => {
+    const runner = runnerWith(true, 4, true);
+    const t = getTurn(db, insertCharacterDraft())!;
+    await runner.confirm({ kind: 'chr', turnId: t.id, nonce: t.confirm_nonce!, userId: 'u2', campaign, target: target() });
+    for (let i = 0; i < 20 && !built.length; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(built).toHaveLength(1);
   });
 });

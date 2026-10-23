@@ -12,7 +12,7 @@ import { loadConfig } from '../src/config.js';
 import { acquireInstanceLock, getCampaignByChannel, getMember, openDatabase, parseConfig, projectRoot } from '../src/database.js';
 import { configureLog, configureLogFile } from '../src/log.js';
 import { createProvider } from '../src/providers.js';
-import { createDioramaRenderer, loadDioramaConfig } from '../src/diorama.js';
+import { createDioramaRenderer, createMiniatureBuilder, loadDioramaConfig } from '../src/diorama.js';
 import { createWorkshopGenerator, ImageQueue, loadImageConfig } from '../src/images.js';
 import { exec } from 'node:child_process';
 import { renderSheet, renderUsage } from '../src/render.js';
@@ -71,7 +71,7 @@ const runner = new TurnRunner({
   delivery,
   modelLimiter: new Semaphore(1),
   images: imageConfig.enabled ? { generator: createWorkshopGenerator(imageConfig), queue: gpuQueue, config: imageConfig } : undefined,
-  diorama: dioramaConfig.enabled ? { renderer: createDioramaRenderer(dioramaConfig), queue: gpuQueue } : undefined,
+  diorama: dioramaConfig.enabled ? { renderer: createDioramaRenderer(dioramaConfig), queue: gpuQueue, miniatures: createMiniatureBuilder(dioramaConfig) } : undefined,
 });
 
 let campaign = getCampaignByChannel(db, GUILD, CHANNEL);

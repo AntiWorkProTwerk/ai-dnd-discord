@@ -8,7 +8,7 @@ import { acquireInstanceLock, openDatabase } from './database.js';
 import { attachHandlers, createDiscordClient, createDiscordDelivery } from './discord.js';
 import path from 'node:path';
 import { configureLog, configureLogFile, log } from './log.js';
-import { createDioramaRenderer, loadDioramaConfig } from './diorama.js';
+import { createDioramaRenderer, createMiniatureBuilder, loadDioramaConfig } from './diorama.js';
 import { createWorkshopGenerator, ImageQueue, loadImageConfig } from './images.js';
 import { createProvider } from './providers.js';
 import { TurnRunner } from './turns.js';
@@ -36,7 +36,7 @@ async function main(): Promise<void> {
     delivery: createDiscordDelivery(client),
     modelLimiter: new Semaphore(config.limits.maxConcurrentModelTurns),
     images: imageConfig.enabled ? { generator: createWorkshopGenerator(imageConfig), queue: gpuQueue, config: imageConfig } : undefined,
-    diorama: dioramaConfig.enabled ? { renderer: createDioramaRenderer(dioramaConfig), queue: gpuQueue } : undefined,
+    diorama: dioramaConfig.enabled ? { renderer: createDioramaRenderer(dioramaConfig), queue: gpuQueue, miniatures: createMiniatureBuilder(dioramaConfig) } : undefined,
   });
   attachHandlers(client, { db, config, runner });
 

@@ -80,6 +80,33 @@ export function createDioramaRenderer(cfg: DioramaConfig): DioramaRenderer {
   };
 }
 
+export interface MiniatureBuilder {
+  build(portraitPath: string, outPath: string, workDir: string): Promise<{ path: string; seconds: number }>;
+}
+
+/** Portrait to GLB through the local 3D pipeline's pinned Pixal3D graph (about a minute). */
+export function createMiniatureBuilder(cfg: DioramaConfig): MiniatureBuilder {
+  const script = path.join(projectRoot(), 'scripts', 'miniature.py');
+  return {
+    build(portraitPath, outPath, workDir) {
+      return new Promise((resolve, reject) => {
+        const args = [script, '--pipeline-root', cfg.pipelineRoot, '--image', portraitPath, '--out', outPath, '--work', workDir];
+        execFile(cfg.python, args, { timeout: 20 * 60_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+          const line = stdout.trim().split(/\r?\n/).pop() ?? '';
+          let r: { ok: boolean; path?: string; seconds?: number; error?: string; busy?: boolean };
+          try {
+            r = JSON.parse(line);
+          } catch {
+            return reject(new Error(err ? String(err.message).slice(0, 300) : 'no output from miniature builder'));
+          }
+          if (r.ok) return resolve({ path: r.path!, seconds: r.seconds ?? 0 });
+          reject(r.busy ? new ImageBusyError('the GPU is busy with another pipeline job') : new Error(r.error ?? 'miniature build failed'));
+        });
+      });
+    },
+  };
+}
+
 export function dioramaPathFor(dataDir: string, turn: Pick<TurnRow, 'campaign_id' | 'id'>, ext: 'png' | 'mp4' = 'png'): string {
   return path.join(dataDir, 'images', turn.campaign_id, `diorama-turn-${turn.id}.${ext}`);
 }

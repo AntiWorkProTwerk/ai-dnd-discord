@@ -73,6 +73,43 @@ def box(x0, y0, w, d, h, mat, z0=0.0):
     return add(o, mat)
 
 
+def miniature(path, cx, cy, s, down):
+    """Stands a character's 3D miniature (GLB from the 3D pipeline) on its base, scaled to a
+    figure's height and facing the camera. Returns False if it cannot be loaded."""
+    import os
+
+    if not os.path.isfile(path):
+        return False
+    before = set(bpy.data.objects)
+    try:
+        bpy.ops.import_scene.gltf(filepath=path)
+    except Exception:
+        return False
+    meshes = [o for o in bpy.data.objects if o not in before and o.type == 'MESH']
+    if not meshes:
+        return False
+    holder = bpy.data.objects.new('mini', None)
+    bpy.context.scene.collection.objects.link(holder)
+    bpy.context.view_layer.update()
+    pts = [o.matrix_world @ Vector(c) for o in meshes for c in o.bound_box]
+    lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    for o in [o for o in bpy.data.objects if o not in before and o.parent is None and o is not holder]:
+        o.parent = holder
+    height = PERSON * (1 if s == 1 else 0.85 * s)
+    k = height / max(hi.z - lo.z, 1e-6)
+    holder.scale = (k, k, k)
+    # Stand it on its feet: center on the lowest part of the mesh, not the bounding box (a bow or
+    # a cloak would otherwise push the figure off its base).
+    feet = [o.matrix_world @ v.co for o in meshes for v in o.data.vertices]
+    cut = lo.z + 0.12 * (hi.z - lo.z)
+    feet = [p for p in feet if p.z <= cut] or [(lo + hi) / 2]
+    fx = sum(p.x for p in feet) / len(feet)
+    fy = sum(p.y for p in feet) / len(feet)
+    holder.location = (cx - k * fx, cy - k * fy, 0.08 - k * lo.z)
+    return True
+
+
 def figure(t):
     cx = t['x'] + t['size'] / 2
     cy = -(t['y'] + t['size'] / 2)
@@ -83,6 +120,8 @@ def figure(t):
     ring = material('turn', '#ffcc33', rough=0.3, metal=0.6, emission='#ffcc33')
     bpy.ops.mesh.primitive_cylinder_add(radius=0.42 * s, depth=0.08, location=(cx, cy, 0.04), vertices=40)
     add(bpy.context.active_object, ring if t['isTurn'] else base)
+    if t.get('model') and not down and miniature(t['model'], cx, cy, s, down):
+        return
     if down:
         # A fallen figure lies on its base.
         bpy.ops.mesh.primitive_cylinder_add(radius=0.16 * s, depth=0.9 * s, location=(cx, cy, 0.24), rotation=(0, math.pi / 2, 0.6))
@@ -179,7 +218,7 @@ def main():
         x0, x1, y0, y1 = 0, cols, 0, rows
     target = Vector(((x0 + x1) / 2, -(y0 + y1) / 2, 0.4))
     span = max(x1 - x0, (y1 - y0) * 1.6, 5)
-    dist = span * 1.05 + 2
+    dist = span * 0.8 + 1.5
     elev = math.radians(40)
     cam_data = bpy.data.cameras.new('cam')
     cam_data.lens = 35

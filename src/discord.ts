@@ -106,7 +106,8 @@ export function buildCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody
         .setName('portrait')
         .setDescription("Show your character's reference portrait (used to keep illustrations consistent)")
         .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true))
-        .addBooleanOption((o) => o.setName('regenerate').setDescription('Paint a new portrait').setRequired(false)),
+        .addBooleanOption((o) => o.setName('regenerate').setDescription('Paint a new portrait (or rebuild the miniature)').setRequired(false))
+        .addBooleanOption((o) => o.setName('miniature').setDescription('Build the 3D miniature used in dioramas (about a minute)').setRequired(false)),
     )
     .addSubcommand((s) => s.setName('recap').setDescription('Recap the story so far'))
     .addSubcommand((s) => s.setName('gm').setDescription('Owner: correction, clarification, or world-advance instruction').addStringOption(text('Instruction to the GM')))
@@ -306,6 +307,13 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
       const id = chosen.id ?? getMember(db, campaign.id, i.user.id)?.character_record_id;
       if (!id) return reply(i, 'You have no character here yet: `/rpg character`.');
       await i.deferReply({ flags: MessageFlags.Ephemeral });
+      if (i.options.getBoolean('miniature')) {
+        const m = runner.buildMiniature(campaign.id, id, { force: i.options.getBoolean('regenerate') ?? false });
+        if (!m.done) return reply(i, m.message);
+        if (m.message !== 'ready') await reply(i, m.message);
+        const glb = await m.done;
+        return reply(i, glb ? '🧊 The 3D miniature is ready; dioramas (🧊 or `/rpg diorama`) now show it in place of a plain figure.' : "🧊 Couldn't build the miniature (see the bot log). Try again later.");
+      }
       const r = runner.paintPortrait(campaign.id, id, { force: i.options.getBoolean('regenerate') ?? false });
       if (!r.done) return reply(i, r.message);
       if (r.message !== 'ready') await reply(i, `${r.message} This takes about a minute.`);
