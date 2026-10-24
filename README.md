@@ -210,9 +210,10 @@ Confirmation buttons expire after `CONFIRMATION_TTL_MINUTES` (corrections, undo)
 | `/rpg play` | Players with a character | **Public** | Yes | Main game action. `as:` picks which of your characters acts |
 | `/rpg ask` | Anyone in the channel | Private | Yes | Read-only question. No dice, no writes, player-visible data only |
 | `/rpg sheet` | Players | Private | No | Your sheet and inventory from the database, without GM notes. `as:` picks the character |
-| `/rpg map` | Players | Public map, private acknowledgement | No | Battle map of your storyline (`as:` picks the character) |
+| `/rpg map` | Players | Public map, private acknowledgement | No | Map of the place your character is in (`as:` picks the character) |
+| `/rpg merge` | Players in that storyline, owner | Public announcement, private acknowledgement | No | Run in a side thread: the thread closes and that storyline becomes the main story in the main channel |
 | `/rpg portrait` | Players | Private | No (local image) | Your character's reference portrait; `regenerate:true` paints a new one |
-| `/rpg diorama` | Players | Public | No (local Blender) | Your storyline's battle map as a 3D diorama; `turntable:true` for a rotating video |
+| `/rpg diorama` | Players | Public | No (local Blender) | Your place as a 3D diorama; `turntable:true` for a rotating video |
 | `/rpg recap` | Anyone in the channel | **Public** | Only if the cached recap is stale | Recap from saved events |
 | `/rpg gm` | Owner | Private preview; public announcement on apply | Yes | Correction, clarification or world advance |
 | `/rpg undo` | Owner | Private preview; public announcement on apply | No | Revert the latest world turn |
@@ -225,8 +226,9 @@ Confirmation buttons expire after `CONFIRMATION_TTL_MINUTES` (corrections, undo)
 
 Players don't have to stay together. Each **storyline** is an ordinary active `scene` record whose `participants_ids` lists the characters in it, and different storylines are played **at the same time**, like a live MMO.
 
-- **The main story** lives in the campaign channel. When a character goes off on their own ("I leave the inn and ride for the marshes"), the GM starts a new storyline for them. The bot opens a **thread** for it under the channel, posts a "↪ continues in #thread" pointer, and from then on that player's actions resolve and post there. `/rpg play` works in the thread or in the main channel; from the main channel it posts a pointer and continues in the thread.
-- **Private side stories:** `/rpg play private:true` asks the GM to play that action in your own new private storyline (even if it would not otherwise split off), in a private thread visible only to its players, the owner and server moderators. Its first reply already goes to that thread, not the main channel.
+- **The main story** lives in the campaign channel. When a character goes off somewhere else ("I leave the inn and ride for the marshes"), the GM starts a new storyline for them automatically, so it gets its own turn order and runs at the same time as the others. Its replies keep posting in the channel under their own header (`📍 Into the Rain-Reed Wilds`).
+- **Side threads are the players' choice.** Each reply of a side storyline that is still in the main channel has a **🧵 Side thread** button. The storyline's players or the owner can press it to move that storyline into its own public thread. `/rpg play side:true` does it straight away. Anyone whose character goes to that place joins the storyline and is added to its thread. When they come back, the thread closes and the story continues in the channel.
+- **Private threads are one-on-one with the DM.** `/rpg play private:true` whispers an action: a thought, a secret question, or something done quietly. The answer goes to your own private thread with the DM, created on first use. Only you can see it (plus server moderators, as with any private thread). Anything you play inside that thread is a whisper too. A whisper doesn't move your character out of their storyline, and other players' GM context never includes it. Actions others would plainly notice have to be played openly.
 - **Threads never disappear.** They auto-archive after 7 days of quiet, stay readable, and reopen when posted to. When a storyline ends or rejoins another (characters meet, someone joins the fight), its thread gets a closing line and is archived.
 - **Live and consistent at the same time:**
   - Actions in one storyline resolve in order, because turn order matters there. Different storylines resolve concurrently.
@@ -240,46 +242,63 @@ Players don't have to stay together. Each **storyline** is an ordinary active `s
 - **Testing it alone:** the campaign owner can control several characters. Each `/rpg character` conversation creates another one (names must be unique), then act as each one with `/rpg play as:<name> text: …` (the `as` box autocompletes your characters). The character you pick stays your active one until you pick another. Other players still control one character each, and nobody can act as a character they don't control.
 - Each GM reply starts with a small storyline header, for example `📍 Brawl at the Tallow and Tide · round 2 · Day 1, 18:40`.
 
-### Battle maps (free, exact, no AI)
+### World maps (free, exact, no AI)
 
-The GM keeps track of where everyone stands. When a fight starts, or position matters (a chase, sneaking past a guard, a trap), it gives the scene a grid:
-- **`data.map`:** `{cols, rows, cell_ft, features: [{kind, label, x, y, w, h}]}`. Feature kinds are wall, door, cover, difficult, water, pit, object, stairs and light.
-- **`data.positions`:** `{<record id>: {x, y, size}}`.
+The whole game world is mapped and saved, so it stays consistent: distances are exact, "I walk over to the fireplace" moves you to real cells, and a place looks the same whenever anyone comes back.
+- **Every place is a location with its own grid map** (`data.map`: `{cols, rows, cell_ft, features: [{kind, label, x, y, w, h, to}]}`). Feature kinds are wall, door, cover, difficult, water, pit, object, stairs, light and exit. Doors, stairs and exits carry `to`: the place they lead to.
+- **Everyone has a saved position** (`data.pos {x, y, size}` on each character and npc) on the map of the place they are in. NPCs stay where they were left.
+- **New places are made on the spot.** The first time anyone goes somewhere unmapped (out the back door, down an alley), the GM must create that place and its map in the same move, linked back to where they came from. A whole town is never one map: the GM makes the specific street or room inside it.
+- **Long trips** (another town, days away) use the shared world clock instead of the grid, and put you at the destination's entrance.
 
-The GM moves tokens in the same save as the action and sees a text version of the map, with distances, in its context.
+The GM sees a text version of the current place's map (positions, distances, exits and where they lead, who still needs a spot) and the places nearby.
 
 The server checks every save:
-- everything stays inside the grid;
-- one creature per cell, nobody inside a wall;
-- only the scene's participants are placed;
-- a character is placed in only one scene.
+- a play turn's place has a map, and everyone in it a position;
+- positions are inside the grid, one creature per cell, nobody inside a wall or object;
+- a move within a place has an open path around walls; in a fight it is at most a dash (twice the creature's speed);
+- attacks must reach their target;
+- a new place someone walked into links back to where they came from.
 
-Hidden creatures and secret terrain live in the scene's `gm_notes` and are never drawn.
+Hidden creatures (`gm_notes.pos`) and secret terrain (the location's `gm_notes.map_features`) are never drawn. Battle maps saved on scenes by older versions move to their place automatically at startup.
 
-To see the map (rendered locally as a top-down tactical grid with tokens, a legend, wounded and down markers, and a gold ring for whose turn it is):
+To see the map (a top-down tactical grid with tokens, name labels, a legend, wounded and down markers, and a gold ring for whose turn it is):
 - `/rpg play map:true text: …` posts the map right after the reply.
 - The **🗺️ Map** button under a reply shows the map as it was at that moment.
 - `/rpg map` (optional `as:`) posts your storyline's current map, in its thread for side stories.
 
-### 3D dioramas (optional, free)
+With `DIORAMA=on` the map is drawn over a top-down Blender render of the scene (see below), so you see the room, furniture and figures from above. The grid, colored token rings, names and markers are drawn on top by the bot, so they stay crisp. If Blender fails or the GPU queue is full, you get the flat map instead. Without `DIORAMA=on`, the flat map is always used.
 
-With `DIORAMA=on`, your local Blender (`BLENDER_PATH`, or the path in the 3D pipeline's config) builds the battle map as a tabletop diorama:
-- walls and furniture as blocks, with the walls in front of the figures cut away;
-- a figure on a base for each token, in its map color;
-- fallen figures lying down, and a gold base for whoever's turn it is.
+### One 3D scene, three views (optional, free)
 
-It renders in about 3-15 seconds, positions are exact, and no AI is involved, so there are no extra hands.
+With `DIORAMA=on`, your local Blender (`BLENDER_PATH`, or the path in the 3D pipeline's config) builds **one 3D scene** of the moment from the public game state: walls, floor and furniture from the battle map and the location, and a figure, or the character's saved 3D miniature, where each token stands. The 🗺️ map, the 🧊 diorama and the 🎨 picture are all renders of that same scene, from different cameras:
+- **🗺️ Map:** flat, evenly lit, straight down, with the overlays above.
+- **🧊 Diorama:** a raised 3/4 view with a grid on the floor. `turntable:true` posts a short rotating video instead of a still.
+- **🎨 Picture:** the cinematic shot (see "Rendered 3D scenes" below).
 
-To see one:
+Positions are exact and no AI is involved, so there are no extra hands. Fallen figures lie down, and people who joined mid-round are drawn faded.
+
+To see a diorama:
 - **🧊 Diorama** under a reply (shown when the reply has a battle map) builds that moment.
 - `/rpg play diorama:true` builds it automatically after the reply.
-- `/rpg diorama` (optional `as:`) builds the current map. `turntable:true` posts a short rotating video (48 frames, H.264, about 300 KB) instead of a still.
+- `/rpg diorama` (optional `as:`) builds the current scene. `turntable:true` posts a short rotating video instead of a still.
 
-**3D miniatures.** With both image generation and dioramas on, each player character's portrait is turned into a textured 3D miniature by the local 3D pipeline (`scripts/miniature.py` runs its pinned Pixal3D image-to-model graph). It takes about a minute, happens automatically after a new character's portrait, and is stored at `DATA_DIR/images/<campaign>/miniatures/`. Dioramas then show the miniature, standing on its base, instead of a plain figure. Use `/rpg portrait miniature:true` to build one for an existing character, and add `regenerate:true` to rebuild it. A miniature is rebuilt when the portrait changes. Fallen characters and NPCs still use plain figures.
+**3D miniatures.** With both image generation and `DIORAMA=on`, each player character's portrait is turned into a textured 3D miniature by the local 3D pipeline (`scripts/miniature.py` runs its pinned Pixal3D image-to-model graph). It takes about a minute, happens automatically after a new character's portrait, and is stored at `DATA_DIR/images/<campaign>/miniatures/`. The scene then shows the miniature instead of a plain figure. Use `/rpg portrait miniature:true` to build one for an existing character, and add `regenerate:true` to rebuild it. A miniature is rebuilt when the portrait changes. Maps and dioramas use the miniatures that already exist and never wait to build one; the 🎨 picture builds missing ones for the people in focus first.
 
-Dioramas share the painting queue and the pipeline's GPU lock, so only one heavy job runs at a time. ComfyUI's models are unloaded first when it is idle. `DIORAMA_ENGINE=workbench` gives flat, faster renders.
+All 3D renders share the painting queue and the pipeline's GPU lock, so only one heavy job runs at a time. ComfyUI's models are unloaded first when it is idle.
 
 Discord has no native 3D model viewer. An interactive 3D view would need a Discord Activity (an embedded web app on a public HTTPS host), which isn't built.
+
+### Rendered 3D scenes (🎨, default)
+
+With `IMAGE_GENERATION=comfy` and `DIORAMA=on`, the 🎨 Illustrate button and `illustrate:true` render the moment as a **3D scene in Blender** instead of painting it:
+- **People:** the saved 3D miniatures stand where the battle map puts them, turned toward their opponent. Fallen characters lie on the ground.
+- **Room:** walls, floor and furniture are built from the map and the location's description (wood or stone, bar counter, tables, barrels, hearth…). The walls between the camera and the action are cut away.
+- **Light:** follows the scene's time of day and weather.
+- **Camera:** a cinematic view from behind the acting character toward the people in focus.
+
+It's the same models every time, with no AI image artifacts. Scenes without a battle map get a small made-up layout.
+
+The first time a character or NPC is in focus, their portrait and miniature are built first, about a minute each; after that they're reused. If Blender fails, the bot paints the picture instead. Set `IMAGE_MODE=paint` to always use the FLUX paintings described below.
 
 ### Scene illustrations (optional, free)
 

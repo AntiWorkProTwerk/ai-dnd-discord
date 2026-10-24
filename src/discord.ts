@@ -22,7 +22,7 @@ import type { AppConfig } from './config.js';
 import { createCampaign, formatImportReport, isOwner, mayControlSeveral, prepareImport, setLifecycle, WorkflowError } from './campaign.js';
 import { effectiveBudget } from './agent.js';
 import { getCampaign, getCampaignByChannel, getMember, getRecord, getTurn, memberCharacterIds, parseConfig, type Db } from './database.js';
-import { campaignIdForThread } from './storylines.js';
+import { campaignIdForThread, privateThreadOwner } from './storylines.js';
 import { log } from './log.js';
 import { renderSheet, renderUsage, sanitize } from './render.js';
 import { DeliveryError, interactionUsable, type DeliveryPort, type DeliveryTarget, type OutboundMessage, type TurnRunner } from './turns.js';
@@ -76,9 +76,10 @@ export function buildCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody
         .setDescription('Act, speak, fight, build, explore — anything in the fiction')
         .addStringOption(text('What your character does or says'))
         .addBooleanOption((o) => o.setName('illustrate').setDescription('Also paint the scene with the local image pipeline').setRequired(false))
-        .addBooleanOption((o) => o.setName('private').setDescription('Play this in your own private side story (private thread)').setRequired(false))
-        .addBooleanOption((o) => o.setName('map').setDescription('Also post the battle map after the reply').setRequired(false))
-        .addBooleanOption((o) => o.setName('diorama').setDescription('Also post a 3D diorama of the battle map').setRequired(false))
+        .addBooleanOption((o) => o.setName('side').setDescription('Start your own side story, in its own thread, with this action').setRequired(false))
+        .addBooleanOption((o) => o.setName('private').setDescription('Whisper to the DM: a thought, secret question or quiet action, answered in your private thread').setRequired(false))
+        .addBooleanOption((o) => o.setName('map').setDescription('Also post the map of the place after the reply').setRequired(false))
+        .addBooleanOption((o) => o.setName('diorama').setDescription('Also post a 3D diorama of the place').setRequired(false))
         .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true)),
     )
     .addSubcommand((s) => s.setName('ask').setDescription('Ask a rules or public-world question (changes nothing)').addStringOption(text('Your question')))
@@ -91,13 +92,13 @@ export function buildCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody
     .addSubcommand((s) =>
       s
         .setName('map')
-        .setDescription("Show the battle map of your character's current scene")
+        .setDescription("Show the map of the place your character is in")
         .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true)),
     )
     .addSubcommand((s) =>
       s
         .setName('diorama')
-        .setDescription("Show your scene's battle map as a 3D diorama")
+        .setDescription("Show the place your character is in as a 3D diorama")
         .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true))
         .addBooleanOption((o) => o.setName('turntable').setDescription('A short rotating video instead of a still').setRequired(false)),
     )
@@ -107,7 +108,13 @@ export function buildCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody
         .setDescription("Show your character's reference portrait (used to keep illustrations consistent)")
         .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true))
         .addBooleanOption((o) => o.setName('regenerate').setDescription('Paint a new portrait (or rebuild the miniature)').setRequired(false))
-        .addBooleanOption((o) => o.setName('miniature').setDescription('Build the 3D miniature used in dioramas (about a minute)').setRequired(false)),
+        .addBooleanOption((o) => o.setName('miniature').setDescription('Build the 3D miniature used in dioramas (about 3 minutes)').setRequired(false)),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('merge')
+        .setDescription('Move a side thread back into the main channel and make it the main story (use it in the thread)')
+        .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true)),
     )
     .addSubcommand((s) => s.setName('recap').setDescription('Recap the story so far'))
     .addSubcommand((s) => s.setName('gm').setDescription('Owner: correction, clarification, or world-advance instruction').addStringOption(text('Instruction to the GM')))
@@ -153,6 +160,10 @@ export function createDiscordDelivery(client: Client): DeliveryPort {
         }
       }
       return res.id;
+    },
+
+    async addThreadMember(threadId: string, userId: string): Promise<void> {
+      await client.rest.put(Routes.threadMembers(threadId, userId));
     },
 
     async archiveThread(threadId: string): Promise<void> {
@@ -323,6 +334,12 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
       await i.editReply({ content: `🖼️ **${sanitize(name)}**`, files: [{ attachment: p.path, name: 'portrait.png' }], allowedMentions: { parse: [] } });
       return;
     }
+    case 'merge': {
+      const chosen = pickCharacter(db, campaign, i);
+      if (chosen.error) return reply(i, chosen.error);
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      return reply(i, await runner.mergeToMain(campaign, i.user.id, i.channelId, chosen.id));
+    }
     case 'sheet': {
       const chosen = pickCharacter(db, campaign, i);
       if (chosen.error) return reply(i, chosen.error);
@@ -372,15 +389,20 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
 
   const mode = MODEL_MODES[sub as keyof typeof MODEL_MODES];
   if (!mode) return reply(i, 'Unknown command.');
-  const ephemeral = EPHEMERAL.has(sub);
+  // Anything played inside your own private thread is a whisper too. A whisper sent from a public
+  // channel is acknowledged privately; the answer itself goes to the private thread.
+  const inOwnThread = privateThreadOwner(db, campaign.id, i.channelId) === i.user.id;
+  const whispering = sub === 'play' && ((i.options.getBoolean('private') ?? false) || inOwnThread);
+  const ephemeral = EPHEMERAL.has(sub) || (whispering && !inOwnThread);
   // Model work can take longer than Discord's 3-second window: defer first.
   await i.deferReply(ephemeral ? { flags: MessageFlags.Ephemeral } : {});
   const text = sub === 'recap' ? 'recap' : i.options.getString('text', true);
   const illustrate = sub === 'play' ? (i.options.getBoolean('illustrate') ?? false) : false;
   const map = sub === 'play' ? (i.options.getBoolean('map') ?? false) : false;
   const diorama = sub === 'play' ? (i.options.getBoolean('diorama') ?? false) : false;
-  const privateStory = sub === 'play' ? (i.options.getBoolean('private') ?? false) : false;
-  const r = runner.submit({ campaign, userId: i.user.id, mode, requestId: i.id, text, target: targetOf(i, ephemeral), illustrate, privateStory, characterId, map, diorama });
+  const privateStory = whispering;
+  const sideStory = sub === 'play' ? (i.options.getBoolean('side') ?? false) && !whispering : false;
+  const r = runner.submit({ campaign, userId: i.user.id, mode, requestId: i.id, text, target: targetOf(i, ephemeral), illustrate, privateStory, sideStory, characterId, map, diorama });
   if (r.status !== 'queued') await reply(i, r.message ?? 'Request not accepted.');
 }
 
@@ -471,6 +493,8 @@ export async function handleButton(deps: DiscordDeps, i: ButtonInteraction): Pro
       ? deps.runner.illustrate(Number(m[2]), campaign.id).message
       : m[1] === 'map'
       ? await deps.runner.postMap(Number(m[2]), campaign.id)
+      : m[1] === 'side'
+      ? await deps.runner.requestSideThread(Number(m[2]), i.user.id, campaign.id)
       : m[1] === 'dio'
       ? deps.runner.diorama(Number(m[2]), campaign.id).message
       : await deps.runner.confirm({ kind: m[1]!, turnId: Number(m[2]), nonce: m[3]!, userId: i.user.id, campaign, target: targetOf(i, true) });

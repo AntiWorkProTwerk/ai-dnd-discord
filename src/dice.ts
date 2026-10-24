@@ -102,6 +102,10 @@ export interface RollRequest {
   comparison: Comparison | null;
   related_ids: string[];
   visibility: 'public' | 'gm';
+  /** Attacks only: who attacks whom, and the attack's reach/range in feet (checked on the map). */
+  attacker_id?: string | null;
+  target_id?: string | null;
+  reach_ft?: number | null;
 }
 
 export interface RollRecord extends RollRequest {

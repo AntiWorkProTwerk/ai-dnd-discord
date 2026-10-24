@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { z } from 'zod';
 import type { AppConfig } from './config.js';
-import { asciiMap } from './maps.js';
+import { asciiMap, CREATURE_KINDS, dbView, placedIn, placeIdOf, posOf, readMap, scenePlaceId, type WorldView } from './maps.js';
 import { emptyUsage, getCampaign, getRecord, getTurn, monthUsage, nowIso, parseConfig, parseUsage, playerCharacterOwners, projectRoot, type Db } from './database.js';
 import type { RollRecord } from './dice.js';
 import { ProviderError, type ConversationItem, type ModelProvider } from './providers.js';
@@ -95,25 +95,66 @@ function brief(r: RecordRow): string {
   return `${r.id} [${r.kind}] ${r.name}`;
 }
 
-function recentTurns(db: Db, campaignId: string, n: number, view: 'gm' | 'player', excludeTurnId?: number): TurnRow[] {
+/** Whispered (private) turns are history only for the player who made them. */
+const SEEN_BY = `(json_extract(delivery_json, '$.whisper') IS NULL OR actor_user_id = ?)`;
+
+function recentTurns(db: Db, campaignId: string, n: number, view: 'gm' | 'player', excludeTurnId: number | undefined, viewerUserId: string): TurnRow[] {
   const rows = db
     .prepare(
       `SELECT * FROM turns WHERE campaign_id = ? AND status IN ('committed', 'delivered')
-         AND mode IN ('play', 'correction', 'undo') AND id <> ? ORDER BY id DESC LIMIT ?`,
+         AND mode IN ('play', 'correction', 'undo') AND id <> ? AND ${SEEN_BY} ORDER BY id DESC LIMIT ?`,
     )
-    .all(campaignId, excludeTurnId ?? -1, n) as TurnRow[];
+    .all(campaignId, excludeTurnId ?? -1, viewerUserId, n) as TurnRow[];
   void view;
   return rows.reverse();
 }
 
 /** Recent events of one storyline. Turns from before storylines existed belong to the main one. */
-function recentTurnsIn(db: Db, campaignId: string, sceneId: string, main: boolean, n: number, excludeTurnId: number): TurnRow[] {
+/** The map of the place the actor is in (or what to do when it has none) and the places around it. */
+function placeSection(db: Db, campaignId: string, view: WorldView, placeId: string | null, actor: RecordRow | null): string {
+  if (!placeId) {
+    return actor
+      ? `## Where you are\n${actor.name} is not in any location. In this save set their parent_id to the location they are in (create it, with a map, if it is new) and give them data.pos on its map.`
+      : '## Where you are\n(no place)';
+  }
+  const place = view.get(placeId)!;
+  const grid = asciiMap(db, campaignId, placeId, actor?.id ?? null);
+  const out: string[] = [];
+  if (grid) {
+    out.push(`## Place map: ${place.name} (${place.id})\nThe saved map of where the action is. Keep it exact: positions, distances and exits are real.\n${grid}`);
+  } else {
+    const here = placedIn(view, placeId).filter((r) => CREATURE_KINDS.has(r.kind));
+    out.push(
+      `## Place map: ${place.name} (${place.id}) - NOT MAPPED YET\n` +
+        `Nobody can act here until it is mapped. In this save, either:\n` +
+        `- if it is one place (a room, a hall, a street, a clearing): set data.map on ${place.id} from its description, and data.pos on the acting character and anyone involved; or\n` +
+        `- if it is a whole town, district or region: create the specific place inside it where the action is (kind "location", parent_id ${place.id}, with data.map and exits), and move the characters there (parent_id and data.pos).\n` +
+        `Recorded here: ${here.map((r) => `${r.name} (${r.id})${posOf(r) ? '' : ' [no position]'}`).join(', ') || 'nobody'}. Move only those who are really at the spot; townsfolk elsewhere in a town stay where they are (in the town record) until someone goes to them.`,
+    );
+  }
+  // Places around: the containing area, its other places, and places inside this one.
+  const around = new Map<string, string>();
+  const parent = place.parent_id ? view.get(place.parent_id) : undefined;
+  if (parent?.kind === 'location') around.set(parent.id, 'contains this place');
+  for (const r of parent?.kind === 'location' ? view.childrenOf(parent.id) : []) if (r.kind === 'location' && r.id !== placeId) around.set(r.id, `also in ${parent!.name}`);
+  for (const r of view.childrenOf(placeId)) if (r.kind === 'location') around.set(r.id, 'inside this place');
+  if (around.size) {
+    const lines = [...around].slice(0, 12).map(([id, how]) => {
+      const r = view.get(id)!;
+      return `- ${r.name} (${id}): ${how}; ${readMap(r.data.map) ? 'mapped' : 'not mapped yet'}`;
+    });
+    out.push(`## Places nearby\n${lines.join('\n')}`);
+  }
+  return out.join('\n\n');
+}
+
+function recentTurnsIn(db: Db, campaignId: string, sceneId: string, main: boolean, n: number, excludeTurnId: number, viewerUserId: string): TurnRow[] {
   const rows = db
     .prepare(
       `SELECT * FROM turns WHERE campaign_id = ? AND status IN ('committed', 'delivered') AND mode IN ('play', 'correction', 'undo')
-         AND id <> ? AND (scene_id = ? ${main ? 'OR scene_id IS NULL' : ''}) ORDER BY id DESC LIMIT ?`,
+         AND id <> ? AND (scene_id = ? ${main ? 'OR scene_id IS NULL' : ''}) AND ${SEEN_BY} ORDER BY id DESC LIMIT ?`,
     )
-    .all(campaignId, excludeTurnId, sceneId, n) as TurnRow[];
+    .all(campaignId, excludeTurnId, sceneId, viewerUserId, n) as TurnRow[];
   return rows.reverse();
 }
 
@@ -227,7 +268,7 @@ export function buildContext({ db, campaign, turn, ctx }: ContextInput): string 
       const d = sceneData(s);
       const who = participants(s).map(nameOf).join(', ') || 'nobody';
       const last = db
-        .prepare(`SELECT public_reply FROM turns WHERE campaign_id = ? AND scene_id = ? AND status IN ('committed', 'delivered') ORDER BY id DESC LIMIT 1`)
+        .prepare(`SELECT public_reply FROM turns WHERE campaign_id = ? AND scene_id = ? AND status IN ('committed', 'delivered') AND json_extract(delivery_json, '$.whisper') IS NULL ORDER BY id DESC LIMIT 1`)
         .get(campaign.id, s.id) as { public_reply: string | null } | undefined;
       const place = s.parent_id ? nameOf(s.parent_id) : '?';
       return `- ${s.name} (${s.id})${isMain(db, s) ? ' [main storyline]' : ''}: ${who} at ${place}; time ${formatClock(timeMin(s))}${typeof d.round === 'number' ? `, round ${d.round}` : ''}${d.pending_decision ? `; pending: ${clip(String(d.pending_decision), 160)}` : ''}${last?.public_reply ? `\n  last: ${clip(last.public_reply, 220)}` : ''}`;
@@ -237,22 +278,30 @@ export function buildContext({ db, campaign, turn, ctx }: ContextInput): string 
     } else if (myScene && visible(myScene)) {
       const outsider =
         actorChar && !participants(myScene).includes(actorChar.id)
-          ? `\nNOTE: ${actorChar.name} is NOT a participant of this scene yet and is not bound by its turn order. If they join what is happening here, add them to participants_ids (and the initiative if one is running). If their action takes them off on their own, create a new scene for them now (see Storylines).`
+          ? `\nNOTE: ${actorChar.name} is NOT a participant of this scene yet and is not bound by its turn order. If they join what is happening here, add them to participants_ids (and move them here with parent_id and data.pos if they come from elsewhere); to join a running fight, append them to the END of the initiative with waiting: true (allowed right now, whoever's turn it is). If their action takes them off on their own, create a new scene for them now (see Storylines).`
           : '';
       const noClock = timeMin(myScene) === null ? '\nThis scene has no time_min yet: set it now (in-world minutes since Day 1 00:00, matching its time).' : '';
       sections.push(`## Your storyline (the scene being played; it is ${isMain(db, myScene) ? 'the main storyline' : 'a side storyline'})\n${J(projectRecord(myScene, ctx))}${outsider}${noClock}`);
-      const grid = asciiMap(db, campaign.id, myScene, actorChar?.id ?? null);
-      if (grid) sections.push(`## Battle map (this storyline)\n${grid}`);
       // `/rpg play private:true`: the player wants this action played in their own private storyline.
-      const wantsPrivate = turn.mode === 'play' && !!(JSON.parse(turn.delivery_json) as { private_story?: boolean }).private_story;
+      // `/rpg play side:true` (or private:true): the player asks for their own side storyline.
+      const asked = turn.mode === 'play' ? (JSON.parse(turn.delivery_json) as { side_story?: boolean; whisper?: boolean }) : {};
       const shared = isMain(db, myScene) || participants(myScene).some((p) => p !== actorChar?.id && playerCharacterOwners(db, campaign.id).has(p));
-      if (wantsPrivate && actorChar && shared) {
+      if (asked.whisper && actorChar) {
         sections.push(
-          `## Private request\nThe player chose to play this action PRIVATELY. Split ${actorChar.name} off into their own new side storyline now (see Storylines), with \`private: true\` in the new scene's data, and resolve the action there; do not ask. If they were in a fight here, remove them from its initiative and narrate how they step away. Only if the action can happen nowhere but this shared scene (for example attacking someone here) resolve it normally and say in one short sentence that it stays in the shared scene.`,
+          `## Private action (whispered to you)\nThe player sent this PRIVATELY: the reply goes only to them, in their private thread with you. It may be a thought, a secret question, or a quiet action.\n- Answer only what ${actorChar.name} would know or perceive. Store anything secret that results (a pocketed item, a private clue) with visibility "owner" (their own) or in gm_notes, never in public data.\n- Do not split them into a new storyline, and do not move the shared scene's turn order for a thought or a question. A quiet action takes their turn only if it is their turn in a fight.\n- If the action could not be hidden (attacking someone, shouting, anything others would plainly notice), do not resolve it here: say so and ask them to do it openly with /rpg play.`,
+        );
+      } else if (asked.side_story && actorChar && shared) {
+        sections.push(
+          `## Side story request\nThe player asked to play this action as their own side story (it gets its own thread). Split ${actorChar.name} off into a new side storyline now (see Storylines) and resolve the action there; do not ask. If they were in a fight here, remove them from its initiative, move them (parent_id and data.pos) and narrate how they step away. Only if the action can happen nowhere but this shared scene (for example attacking someone here) resolve it normally and say in one short sentence that it stays in the shared scene.`,
         );
       }
     } else {
       sections.push('## Your storyline\n(no active scene yet; create one for this storyline when the action needs it)');
+    }
+    if (!ownerView || actorChar) {
+      const view = dbView(db, campaign.id);
+      const placeId = actorChar ? placeIdOf(view, actorChar.id) : myScene ? scenePlaceId(view, myScene) : null;
+      sections.push(placeSection(db, campaign.id, view, placeId, actorChar ?? null));
     }
     const elsewhere = scenes.filter((s) => s.id !== myScene?.id && participants(s).length);
     if (!ownerView && elsewhere.length) {
@@ -332,7 +381,7 @@ export function buildContext({ db, campaign, turn, ctx }: ContextInput): string 
     const events = db
       .prepare(
         `SELECT * FROM turns WHERE campaign_id = ? AND id > ? AND status IN ('committed', 'delivered')
-           AND mode IN ('play', 'correction', 'undo') ORDER BY id DESC LIMIT 40`,
+           AND mode IN ('play', 'correction', 'undo') AND json_extract(delivery_json, '$.whisper') IS NULL ORDER BY id DESC LIMIT 40`,
       )
       .all(campaign.id, since) as TurnRow[];
     sections.push(`## Public narration since then (oldest first)\n${formatEvents(db, campaign.id, events.reverse(), 'player')}`);
@@ -350,7 +399,7 @@ export function buildContext({ db, campaign, turn, ctx }: ContextInput): string 
   } else if (turn.mode !== 'configure') {
     const summary = summaryRecord(db, campaign.id, '_gm_summary');
     if (summary && view === 'gm') sections.push(`## Earlier history (summary; current records override it)\n${clip(String((JSON.parse(summary.data_json) as { text?: string }).text ?? ''), 3000)}`);
-    const recent = myScene ? recentTurnsIn(db, campaign.id, myScene.id, isMain(db, myScene), 8, turn.id) : recentTurns(db, campaign.id, 8, view, turn.id);
+    const recent = myScene ? recentTurnsIn(db, campaign.id, myScene.id, isMain(db, myScene), 8, turn.id, ctx.actorUserId) : recentTurns(db, campaign.id, 8, view, turn.id, ctx.actorUserId);
     sections.push(`## Recent events${myScene ? ' in this storyline' : ''} (oldest first)\n${formatEvents(db, campaign.id, recent, view)}`);
   }
 
@@ -544,6 +593,18 @@ export async function runAgent(deps: AgentDeps, opts: AgentRunOptions): Promise<
         if (r.output.length < 200) continue;
         inputTokens -= estimateTokens(r.output);
         r.output = JSON.stringify({ ok: true, elided: true, note: 'Older output removed to fit the context limit; call the tool again if you need it.' });
+      }
+      // Retries of a rejected save carry the whole batch again: keep only the latest attempt in full.
+      const saves = items.flatMap((x) => (x.type === 'assistant' ? x.toolCalls.filter((c) => c.name === 'save_turn').map((c) => ({ c, raw: x.raw })) : []));
+      for (const { c, raw } of saves.slice(0, -1)) {
+        if (c.arguments.length < 400) continue;
+        inputTokens -= estimateTokens(c.arguments);
+        c.arguments = JSON.stringify({ elided: true, note: 'An earlier save_turn attempt, rejected (its error follows); the latest attempt is below.' });
+        // The provider replays its raw output items: shorten the same call there too.
+        for (const r of raw ?? []) {
+          const fc = r as { type?: string; call_id?: string; arguments?: string };
+          if (fc.type === 'function_call' && fc.call_id === c.id) fc.arguments = c.arguments;
+        }
       }
     }
     if (inputTokens > config.limits.maxInputTokensPerCall) {

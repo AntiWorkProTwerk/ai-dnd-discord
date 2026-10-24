@@ -112,9 +112,9 @@ beforeEach(() => {
   });
   db.prepare(`UPDATE campaigns SET status = 'active', revision = 1 WHERE id = ?`).run(campaign.id);
   const created = seed([
-    op({ op: 'create', ref: '$gate', kind: 'location', name: 'East Gate', data_json: '{"description":"A gate"}' }),
-    op({ op: 'create', ref: '$guard', kind: 'npc', name: 'Gate guard', parent_id: '$gate', data_json: '{"hp":{"current":12,"max":12}}', gm_notes_json: '{"secret":"hides a deserter"}' }),
-    op({ op: 'create', ref: '$alice', kind: 'character', name: 'Mira', parent_id: '$gate', data_json: '{"hp":{"current":10,"max":10}}' }),
+    op({ op: 'create', ref: '$gate', kind: 'location', name: 'East Gate', data_json: JSON.stringify({ description: 'A gate', map: { cols: 8, rows: 6, cell_ft: 5, features: [] } }) }),
+    op({ op: 'create', ref: '$guard', kind: 'npc', name: 'Gate guard', parent_id: '$gate', data_json: '{"hp":{"current":12,"max":12},"pos":{"x":3,"y":2}}', gm_notes_json: '{"secret":"hides a deserter"}' }),
+    op({ op: 'create', ref: '$alice', kind: 'character', name: 'Mira', parent_id: '$gate', data_json: '{"hp":{"current":10,"max":10},"pos":{"x":2,"y":2}}' }),
   ]);
   aliceChar = created.$alice!;
   guardId = created.$guard!;
@@ -269,7 +269,7 @@ describe('recovery', () => {
   it('resumes an interrupted turn with its saved dice instead of rolling again', async () => {
     const r = runner.submit({ campaign, userId: ALICE, mode: 'play', requestId: 'crash', text: 'attack', target: target() });
     // Simulate a crash mid-turn: the first attempt rolled, then the process died before saving.
-    provider.steps.push(() => ({ toolCalls: [call('roll_dice', { check_id: 'atk', purpose: 'attack', expression: '1d20+3', modifier: null, target: 12, comparison: '>=', related_ids: [], visibility: 'public' })] }));
+    provider.steps.push(() => ({ toolCalls: [call('roll_dice', { check_id: 'atk', purpose: 'attack', expression: '1d20+3', modifier: null, target: 12, comparison: '>=', related_ids: [], visibility: 'public', attacker_id: aliceChar, target_id: guardId, reach_ft: 5 })] }));
     provider.steps.push(() => {
       throw new Error('process killed');
     });
@@ -283,7 +283,7 @@ describe('recovery', () => {
       const ctx = (req.items[0] as { text: string }).text;
       expect(ctx).toContain('ALREADY ROLLED');
       expect(ctx).toContain(`atk: attack`);
-      return { toolCalls: [call('roll_dice', { check_id: 'atk', purpose: 'attack', expression: '1d20+3', modifier: null, target: 12, comparison: '>=', related_ids: [], visibility: 'public' })] };
+      return { toolCalls: [call('roll_dice', { check_id: 'atk', purpose: 'attack', expression: '1d20+3', modifier: null, target: 12, comparison: '>=', related_ids: [], visibility: 'public', attacker_id: aliceChar, target_id: guardId, reach_ft: 5 })] };
     });
     provider.steps.push((req) => {
       const out = JSON.parse((req.items[req.items.length - 1] as { output: string }).output);

@@ -50,7 +50,10 @@ function deps(db: Db, provider: ModelProvider, env: Record<string, string> = {})
 function world() {
   const { db } = tempDb();
   const c = newCampaign(db);
-  const ids = seed(db, c.id, [createOp('$pc', 'character', 'Mira', { hp: { current: 10, max: 10 } }, { gm_notes_json: '{"curse":"GMSECRET-hexed"}' })], {
+  const ids = seed(db, c.id, [
+    createOp('$room', 'location', 'Apothecary', { map: { cols: 6, rows: 4, cell_ft: 5, features: [] } }),
+    createOp('$pc', 'character', 'Mira', { hp: { current: 10, max: 10 }, pos: { x: 1, y: 1 } }, { parent_id: '$room', gm_notes_json: '{"curse":"GMSECRET-hexed"}' }),
+  ], {
     characterOwnerUserId: ALICE,
   });
   const t = newTurn(db, c.id, { characterId: ids.$pc!, input: 'I drink the strange potion.' });
@@ -115,6 +118,25 @@ describe('runAgent', () => {
     const firstResult = provider.requests[1]!.items.find((i) => i.type === 'tool_result');
     expect(firstResult && firstResult.type === 'tool_result' && firstResult.output).toMatch(/expected_version/);
     expect(getCampaign(db, c.id)!.revision).toBe(1);
+  });
+
+  it('near the context limit, older rejected saves shrink to a note so the model can still repair the latest', async () => {
+    const { db, pc, ctx } = world();
+    const bad = (n: number) => saveArgs({ operations: [op({ op: 'set', record_id: pc, path: 'data.hp.current', value_json: '5' })], public_reply: `${n} ${'x'.repeat(15000)}` });
+    const at = (r: ProviderResponse, inputTokens: number) => ({ ...r, usage: { inputTokens, outputTokens: 5000 } }); // each big save is output first
+    const provider = new FakeProvider([
+      // Reported input tokens: the system prompt and context, then each retry adds a big save; the
+      // provider counts the conversation as it was sent (after shortening).
+      at(tools(['save_turn', bad(1)]), 8500),
+      at(tools(['save_turn', bad(2)]), 13600),
+      at(tools(['save_turn', bad(3)]), 8700),
+      tools(['save_turn', saveArgs({ operations: [op({ op: 'set', record_id: pc, path: 'data.hp.current', value_json: '5', expected_version: 1 })] })]),
+    ]);
+    const res = await runAgent(deps(db, provider, { MAX_INPUT_TOKENS_PER_CALL: '14000' }), { ctx });
+    expect(res).toMatchObject({ kind: 'saved' });
+    const last = provider.requests[3]!.items.flatMap((i) => (i.type === 'assistant' ? i.toolCalls : []));
+    expect(last.map((c) => JSON.parse(c.arguments).elided ?? false)).toEqual([true, false, false]);
+    expect(JSON.parse(last[2]!.arguments).public_reply).toMatch(/^3 x/);
   });
 
   it('stops before any paid call when the campaign budget is exhausted', async () => {

@@ -55,7 +55,10 @@ export function receipts(db: Db, turn: TurnRow): string[] {
   for (const r of rolls) if (r.visibility === 'public' && used.has(r.check_id)) lines.push(formatRoll(r));
   // Scene bookkeeping (participants, initiative, map positions, clock) is shown by the storyline
   // header and the battle map, not as raw changes.
-  const diffs = (changes.diffs ?? []).filter((d) => !d.hidden && !(d.kind === 'scene' && SCENE_BOOKKEEPING.test(d.field.replace(/^data./, ''))));
+  // Bookkeeping is not news: scene state, positions on the map, and the maps of places.
+  const diffs = (changes.diffs ?? []).filter(
+    (d) => !d.hidden && !(d.kind === 'scene' && SCENE_BOOKKEEPING.test(d.field.replace(/^data./, ''))) && !/^data\.pos(\.|$)/.test(d.field) && !(d.kind === 'location' && /^data\.(map|exits)(\.|$)/.test(d.field)),
+  );
   for (const d of diffs.slice(0, 10)) {
     if (d.field === 'created') lines.push(`➕ ${d.name} (${d.kind})`);
     else if (d.field === 'archived') lines.push(`✖ ${d.name} removed`);

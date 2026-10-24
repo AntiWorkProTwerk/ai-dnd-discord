@@ -167,18 +167,18 @@ if (config) {
       'images',
       missing.length
         ? `missing ${missing.map(([p, what]) => `${what} (${p})`).join(', ')}; the Illustrate button will report failures`
-        : `local pipeline at ${images.pipelineRoot} (${images.width}x${images.height}); ComfyUI starts on first image; references: ${images.references}`,
+        : `local pipeline at ${images.pipelineRoot} (${images.width}x${images.height}); ComfyUI starts on first image; references: ${images.references}; mode: ${images.mode}${images.mode === 'render3d' && !loadDioramaConfig().enabled ? ' (needs DIORAMA=on, painting instead)' : ''}`,
     );
   }
 
   const dio = loadDioramaConfig();
-  if (!dio.enabled) report('PASS', 'dioramas', '3D dioramas are off (DIORAMA=on enables them)');
+  if (!dio.enabled) report('PASS', 'dioramas', '3D renders are off (DIORAMA=on enables the 3D map, dioramas and 3D scenes)');
   else {
     const missing = [
       [dio.blender, 'Blender (BLENDER_PATH)'],
       [dio.python, 'workshop Python (IMAGE_PYTHON)'],
     ].filter(([p]) => !fs.existsSync(p!));
-    report(missing.length ? 'WARN' : 'PASS', 'dioramas', missing.length ? `missing ${missing.map(([p, w]) => `${w} (${p})`).join(', ')}` : `Blender at ${dio.blender} (${dio.engine})`);
+    report(missing.length ? 'WARN' : 'PASS', 'dioramas', missing.length ? `missing ${missing.map(([p, w]) => `${w} (${p})`).join(', ')}` : `Blender at ${dio.blender}`);
   }
 
   try {

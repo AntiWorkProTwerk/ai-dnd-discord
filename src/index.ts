@@ -5,10 +5,11 @@ import { Events } from 'discord.js';
 import { Semaphore } from './agent.js';
 import { loadConfig, secretValues } from './config.js';
 import { acquireInstanceLock, openDatabase } from './database.js';
+import { migrateSceneMaps } from './maps.js';
 import { attachHandlers, createDiscordClient, createDiscordDelivery } from './discord.js';
 import path from 'node:path';
 import { configureLog, configureLogFile, log } from './log.js';
-import { createDioramaRenderer, createMiniatureBuilder, loadDioramaConfig } from './diorama.js';
+import { createMiniatureBuilder, createSceneRenderer, loadDioramaConfig } from './diorama.js';
 import { createWorkshopGenerator, ImageQueue, loadImageConfig } from './images.js';
 import { createProvider } from './providers.js';
 import { TurnRunner } from './turns.js';
@@ -21,10 +22,12 @@ async function main(): Promise<void> {
 
   const releaseLock = acquireInstanceLock(config.dataDir);
   const db = openDatabase(config.databasePath);
+  // Battle maps used to live on scenes; they belong to places now.
+  migrateSceneMaps(db);
   const provider = createProvider(config);
   const imageConfig = loadImageConfig();
   const dioramaConfig = loadDioramaConfig();
-  // Paintings and dioramas share one GPU queue: one heavy job at a time.
+  // Paintings and 3D renders (scene, diorama, map) share one GPU queue: one heavy job at a time.
   const gpuQueue = new ImageQueue(imageConfig.maxQueue);
   log.info('starting', { provider: provider.name, model: provider.model, database: config.databasePath, images: imageConfig.enabled ? imageConfig.pipelineRoot : 'off' });
 
@@ -36,7 +39,7 @@ async function main(): Promise<void> {
     delivery: createDiscordDelivery(client),
     modelLimiter: new Semaphore(config.limits.maxConcurrentModelTurns),
     images: imageConfig.enabled ? { generator: createWorkshopGenerator(imageConfig), queue: gpuQueue, config: imageConfig } : undefined,
-    diorama: dioramaConfig.enabled ? { renderer: createDioramaRenderer(dioramaConfig), queue: gpuQueue, miniatures: createMiniatureBuilder(dioramaConfig) } : undefined,
+    diorama: dioramaConfig.enabled ? { queue: gpuQueue, miniatures: createMiniatureBuilder(dioramaConfig), scene: createSceneRenderer(dioramaConfig) } : undefined,
   });
   attachHandlers(client, { db, config, runner });
 

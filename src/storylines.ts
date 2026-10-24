@@ -124,6 +124,10 @@ export interface ThreadLink {
   private: boolean;
   archived: boolean;
   notified_busy_until?: number;
+  /** Discord users added to the thread so far. */
+  members?: string[];
+  /** A player asked for this storyline's thread (side:true or the 🧵 button). */
+  requested?: boolean;
 }
 
 const THREAD_KIND = '_discord_thread';
@@ -151,7 +155,7 @@ export function saveThread(db: Db, campaignId: string, sceneId: string, patch: P
 
 /** Resolves a campaign from a Discord thread channel the bot created. */
 export function campaignIdForThread(db: Db, threadId: string): string | undefined {
-  const r = db.prepare(`SELECT campaign_id FROM records WHERE kind = ? AND json_extract(data_json, '$.thread_id') = ?`).get(THREAD_KIND, threadId) as
+  const r = db.prepare(`SELECT campaign_id FROM records WHERE kind IN (?, ?) AND json_extract(data_json, '$.thread_id') = ?`).get(THREAD_KIND, PRIVATE_KIND, threadId) as
     | { campaign_id: string }
     | undefined;
   return r?.campaign_id;
@@ -160,4 +164,34 @@ export function campaignIdForThread(db: Db, threadId: string): string | undefine
 export function sceneName(db: Db, campaignId: string, sceneId: string | null): string | null {
   if (!sceneId) return null;
   return getRecord(db, campaignId, sceneId)?.name ?? null;
+}
+
+// ---------------------------------------------------------------- private threads
+
+const PRIVATE_KIND = '_discord_private';
+
+/**
+ * A player's private thread with the DM (whispered actions, thoughts, secret questions). One per
+ * player per campaign; not tied to any place or storyline.
+ */
+export function privateThreadFor(db: Db, campaignId: string, userId: string): { recordId: string; thread_id: string } | undefined {
+  const r = db.prepare(`SELECT * FROM records WHERE campaign_id = ? AND kind = ? AND name = ?`).get(campaignId, PRIVATE_KIND, userId) as RecordRow | undefined;
+  return r ? { recordId: r.id, ...(JSON.parse(r.data_json) as { thread_id: string }) } : undefined;
+}
+
+export function savePrivateThread(db: Db, campaignId: string, userId: string, threadId: string): void {
+  const cur = privateThreadFor(db, campaignId, userId);
+  const ts = nowIso();
+  if (cur) db.prepare('UPDATE records SET data_json = ?, version = version + 1, updated_at = ? WHERE id = ?').run(JSON.stringify({ user_id: userId, thread_id: threadId }), ts, cur.recordId);
+  else
+    db.prepare(
+      `INSERT INTO records (id, campaign_id, kind, name, parent_id, visibility, data_json, gm_notes_json, version, created_at, updated_at)
+       VALUES (?, ?, ?, ?, NULL, 'gm', ?, '{}', 1, ?, ?)`,
+    ).run(newRecordId('discord_private'), campaignId, PRIVATE_KIND, userId, JSON.stringify({ user_id: userId, thread_id: threadId }), ts, ts);
+}
+
+/** The user whose private thread this channel is, if any. */
+export function privateThreadOwner(db: Db, campaignId: string, threadId: string): string | undefined {
+  const r = db.prepare(`SELECT name FROM records WHERE campaign_id = ? AND kind = ? AND json_extract(data_json, '$.thread_id') = ?`).get(campaignId, PRIVATE_KIND, threadId) as { name: string } | undefined;
+  return r?.name;
 }

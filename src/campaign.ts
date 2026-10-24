@@ -26,10 +26,10 @@ import type { CampaignConfig, CampaignRow, Constraint, RecordRow, SourceRole, Tu
 import { validateConstraintList, ValidationError } from './validation.js';
 
 export const DEFAULT_CONVENTIONS = [
-  'character / npc data: appearance (one visual sentence: sex, age, build, hair, face, clothing; used for portraits and illustrations); hp {current, max}; conditions [strings]; coins {<currency>: integer}; plus the stats the rules use, always under the same keys.',
+  'character / npc data: appearance (one visual sentence: sex, age, build, hair, face, clothing; used for portraits and illustrations); hp {current, max}; conditions [strings]; coins {<currency>: integer}; speed (feet); pos {x, y, size} (position on the map of the place it is in; secret ones in gm_notes.pos); plus the stats the rules use, always under the same keys.',
   'item data: quantity (integer >= 0), description, and rule properties (damage, weight, charges, price) as needed.',
-  'location data: description; exits [{to_id, label}].',
-  'scene data (one scene per storyline): status ("active" | "ended"); main (true only for the main storyline); participants_ids [ids]; initiative [{id, value}]; turn_of_id; round; time_min (integer in-world minutes since Day 1 00:00); time (readable form); busy_until_min (long action in progress); pending_decision; map {cols, rows, cell_ft, features [{kind, label, x, y, w, h}]} and positions {<id>: {x, y, size}} (battle map; hidden ones in gm_notes.positions).',
+  'location data: description; map {cols, rows, cell_ft, features [{kind, label, x, y, w, h, to}]} (every place has one; exits are features with "to": the location they lead to; hidden terrain in gm_notes.map_features).',
+  'scene data (one scene per storyline): status ("active" | "ended"); main (true only for the main storyline); participants_ids [ids]; initiative [{id, value}]; turn_of_id; round; time_min (integer in-world minutes since Day 1 00:00); time (readable form); busy_until_min (long action in progress); pending_decision. (Maps belong to locations and positions to the creatures, not to scenes.)',
   'quest data: status ("open" | "completed" | "failed"); objectives [strings]; giver_id; reward.',
   'event data: due (in-world time), description. faction/relationship data: attitude, notes.',
 ].join('\n');

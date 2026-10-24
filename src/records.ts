@@ -2,7 +2,7 @@
 // set, remove, add, move, archive), never RPG actions. A batch is planned against a candidate
 // copy of the affected records and either applied completely or not at all.
 import { playerCharacterOwners, getRecord, newRecordId, nowIso, type Db } from './database.js';
-import { mapProblems, type MapSceneState } from './maps.js';
+import { placeProblems, type PlaceRecord, type WorldView } from './maps.js';
 import type { Constraint, RecordRow, Visibility } from './types.js';
 import {
   assertSafeJson,
@@ -334,19 +334,19 @@ export function planBatch(db: Db, rawOps: RawOperation[], opts: BatchOptions): P
         errors.push(err instanceof Error ? err.message : String(err));
       }
     }
+    const scenes = activeSceneStates(db, opts.campaignId, after);
     if ([...after.values()].some((s) => s.kind === 'scene')) {
-      const scenes = activeSceneStates(db, opts.campaignId, after);
       const overlap = storylineOverlap(db, opts.campaignId, scenes);
       if (overlap) errors.push(overlap);
-      const changed = new Set([...after.values()].filter((s) => s.kind === 'scene').map((s) => s.id));
-      const info = (id: string) => {
-        const st = after.get(id);
-        if (st) return { kind: st.kind, visibility: st.visibility, archived: !!st.archived_at };
-        const row = getRecord(db, opts.campaignId, id);
-        return row ? { kind: row.kind, visibility: row.visibility, archived: !!row.archived_at } : undefined;
-      };
-      errors.push(...mapProblems(scenes, changed, info));
     }
+    const fighting = new Set(
+      scenes.flatMap((s) => (Array.isArray(s.data.initiative) ? (s.data.initiative as unknown[]) : []).map((e) => (typeof e === 'string' ? e : (e as { id?: unknown } | null)?.id))).filter((x): x is string => typeof x === 'string'),
+    );
+    const prior = (id: string) => {
+      const row = before.get(id);
+      return row ? asPlace(toState(row)) : undefined;
+    };
+    errors.push(...placeProblems(worldView(db, opts.campaignId, after), [...after.values()].map(asPlace), prior, (id) => fighting.has(id)));
   }
   if (errors.length) throw new ValidationError(errors.slice(0, 12).join('\n'));
 
@@ -582,13 +582,45 @@ export function cloneState(s: RecordState): RecordState {
   return clone(s);
 }
 
-/**
- * Storyline invariant: a player character may be a participant of at most one active scene, so
- * every action routes to exactly one storyline. Returns an actionable error or null.
- */
+const asPlace = (s: RecordState): PlaceRecord => ({
+  id: s.id,
+  kind: s.kind,
+  name: s.name,
+  parent_id: s.parent_id,
+  visibility: s.visibility,
+  archived: !!s.archived_at,
+  data: s.data,
+  gm_notes: s.gm_notes,
+});
+
+/** The world as it will be after a batch, for the map checks. */
+export function worldView(db: Db, campaignId: string, after: Map<string, RecordState>): WorldView {
+  return {
+    get: (id) => {
+      const st = after.get(id);
+      if (st) return asPlace(st);
+      const row = getRecord(db, campaignId, id);
+      return row ? asPlace(toState(row)) : undefined;
+    },
+    childrenOf: (id) => {
+      const rows = db.prepare('SELECT * FROM records WHERE campaign_id = ? AND parent_id = ? AND archived_at IS NULL').all(campaignId, id) as RecordRow[];
+      const out = rows.filter((row) => !after.has(row.id)).map((row) => asPlace(toState(row)));
+      for (const st of after.values()) if (st.parent_id === id && !st.archived_at) out.push(asPlace(st));
+      return out;
+    },
+  };
+}
+
+interface SceneState {
+  id: string;
+  name: string;
+  data: Record<string, unknown>;
+  gm_notes: Record<string, unknown>;
+}
+
 /** Every active, unarchived scene as it will be after the batch. */
-function activeSceneStates(db: Db, campaignId: string, after: Map<string, RecordState>): MapSceneState[] {
-  const scenes = new Map<string, MapSceneState & { archived: boolean }>();
+function activeSceneStates(db: Db, campaignId: string, after: Map<string, RecordState>): SceneState[] {
+  const scenes = new Map<string, SceneState & { archived: boolean }>();
   for (const row of db.prepare(`SELECT * FROM records WHERE campaign_id = ? AND kind = 'scene'`).all(campaignId) as RecordRow[]) {
     scenes.set(row.id, { id: row.id, name: row.name, archived: !!row.archived_at, data: JSON.parse(row.data_json) as Record<string, unknown>, gm_notes: JSON.parse(row.gm_notes_json || '{}') as Record<string, unknown> });
   }
@@ -596,7 +628,11 @@ function activeSceneStates(db: Db, campaignId: string, after: Map<string, Record
   return [...scenes.values()].filter((s) => !s.archived && (s.data.status === undefined || s.data.status === 'active'));
 }
 
-function storylineOverlap(db: Db, campaignId: string, scenes: MapSceneState[]): string | null {
+/**
+ * Storyline invariant: a player character may be a participant of at most one active scene, so
+ * every action routes to exactly one storyline. Returns an actionable error or null.
+ */
+function storylineOverlap(db: Db, campaignId: string, scenes: SceneState[]): string | null {
   const pcs = new Set(playerCharacterOwners(db, campaignId).keys());
   const where = new Map<string, string[]>();
   for (const s of scenes) {

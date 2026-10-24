@@ -2,6 +2,7 @@
 // stored-reply delivery with retries, owner confirmations, and restart recovery. A committed
 // action is never run again; delivery retries only resend its saved reply.
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import type { AppConfig } from './config.js';
 import { BudgetError, effectiveBudget, runAgent, Semaphore, type AgentResult } from './agent.js';
@@ -47,13 +48,14 @@ import type { RollRecord } from './dice.js';
 import { log } from './log.js';
 import type { ModelProvider } from './providers.js';
 import type { Diff } from './records.js';
-import { buildPortraitPrompt, currentMiniature, currentPortrait, miniaturePathFor, PORTRAIT_SIZE, portraitFor, portraitHash, portraitPathFor, savePortrait, type PortraitInfo } from './portraits.js';
-import { dioramaPathFor, type DioramaRenderer, type MiniatureBuilder } from './diorama.js';
-import { mapPathFor, mapSnapshot, writeMapPng, type MapSnapshot } from './maps.js';
-import { activeScenes, isMain, mainScene, participants, sceneData, saveThread, storylineKey, storylineOf, threadFor, worldClock } from './storylines.js';
+import { buildPortraitPrompt, currentMiniature, currentPortrait, MINIATURE_QUALITY, miniaturePathFor, PORTRAIT_SIZE, portraitFor, portraitHash, portraitPathFor, savePortrait, type PortraitInfo } from './portraits.js';
+import { dioramaPathFor, type MiniatureBuilder, type SceneRenderer } from './diorama.js';
+import { buildSceneSpec, layoutFor, momentNow, type SceneMoment } from './scene3d.js';
+import { composeMapPng, mapPathFor, mapSnapshot, writeMapPng, type MapSnapshot } from './maps.js';
+import { activeScenes, isActiveScene, isMain, mainScene, participants, privateThreadFor, savePrivateThread, sceneData, saveThread, storylineKey, storylineOf, threadFor, worldClock } from './storylines.js';
 import { buildScenePlan, buildScenePrompt, ImageBusyError, imagePathFor, logImageError, type ImageConfig, type ImageGenerator, type ImageQueue } from './images.js';
 import { renderDiffs, renderPlay, sanitize, splitMessage } from './render.js';
-import type { CampaignRow, DeliveryState, ToolContext, TurnMode, TurnRow } from './types.js';
+import type { CampaignRow, DeliveryState, RecordRow, ToolContext, TurnMode, TurnRow } from './types.js';
 
 // ---------------------------------------------------------------- delivery port
 
@@ -100,6 +102,7 @@ export interface DeliveryPort {
   /** Optional: side storylines get their own persistent thread under the campaign channel. */
   createThread?(parentChannelId: string, name: string, isPrivate: boolean, memberUserIds: string[]): Promise<string>;
   archiveThread?(threadId: string): Promise<void>;
+  addThreadMember?(threadId: string, userId: string): Promise<void>;
 }
 
 /** Interaction tokens last 15 minutes; leave a margin. */
@@ -122,6 +125,8 @@ export interface SubmitInput {
   illustrate?: boolean;
   /** Play turns: if this action starts a side storyline, make its thread private. */
   privateStory?: boolean;
+  /** Play turns: start a side storyline (its own thread) for this action. */
+  sideStory?: boolean;
   /** Play turns: post the battle map after the reply. */
   map?: boolean;
   /** Play turns: post a 3D diorama render after the reply. */
@@ -144,11 +149,16 @@ export interface RunnerDeps {
   modelLimiter?: Semaphore;
   /** Optional local image pipeline; absent means illustrations are off. */
   images?: { generator: ImageGenerator; queue: ImageQueue; config: ImageConfig };
-  /** 3D diorama renders (Blender); shares the GPU queue with paintings. */
-  diorama?: { renderer: DioramaRenderer; queue: ImageQueue; miniatures?: MiniatureBuilder };
+  /**
+   * 3D renders (Blender) of one scene: the 🎨 shot, the 🧊 diorama and the 🗺️ map's top-down
+   * base. Shares the GPU queue with paintings.
+   */
+  diorama?: { queue: ImageQueue; miniatures?: MiniatureBuilder; scene: SceneRenderer };
 }
 
 const READ_ONLY: TurnMode[] = ['ask', 'recap', 'summary'];
+/** Pixels per grid cell of the 3D map's top-down render (the flat map's 48-unit cell at 2x). */
+const MAP_PX = 96;
 
 export class TurnRunner {
   private queues = new Map<string, Promise<void>>();
@@ -205,16 +215,19 @@ export class TurnRunner {
     const actingCharacter = input.mode === 'gm' || input.mode === 'configure' || input.mode === 'character' ? null : (input.characterId ?? member?.character_record_id ?? null);
     // Play turns belong to the actor's storyline; its replies go to that storyline's channel.
     const scene = input.mode === 'play' ? storylineOf(db, input.campaign.id, actingCharacter) : undefined;
-    const storyChannel = scene ? this.channelForScene(input.campaign, scene.id) : input.target.channelId;
+    // A whispered action is answered in the player's private thread (routed once it is resolved).
+    const whisper = !!input.privateStory && input.mode === 'play';
+    const storyChannel = scene && !whisper ? this.channelForScene(input.campaign, scene.id) : input.target.channelId;
     const redirected = input.mode === 'play' && storyChannel !== input.target.channelId;
     const delivery: DeliveryState & Record<string, unknown> = {
       channel_id: storyChannel,
       interaction: input.target.interaction ? { ...input.target.interaction, ephemeral: input.target.ephemeral } : undefined,
-      private: input.target.ephemeral,
+      private: whisper ? false : input.target.ephemeral,
       ...(input.illustrate && input.mode === 'play' ? { auto_image: true } : {}),
       ...(input.map && input.mode === 'play' ? { auto_map: true } : {}),
       ...(input.diorama && input.mode === 'play' ? { auto_diorama: true } : {}),
-      ...(input.privateStory && input.mode === 'play' ? { private_story: true } : {}),
+      ...(whisper ? { whisper: true } : {}),
+      ...(input.sideStory && input.mode === 'play' ? { side_story: true } : {}),
       ...(redirected ? { redirect_from: input.target.channelId } : {}),
     };
     const { turn, created } = insertTurn(db, {
@@ -372,11 +385,17 @@ export class TurnRunner {
         // Open threads first: an action that split the actor off is answered in its new thread
         // (essential for private side stories, whose first reply must not land in the main channel).
         await this.syncStorylines(turn.campaign_id, getTurn(db, turn.id)!);
-        this.followActor(turn.id);
+        if ((JSON.parse(getTurn(db, turn.id)!.delivery_json) as { whisper?: boolean }).whisper) await this.routeToPrivateThread(turn.id);
+        else this.followActor(turn.id);
         this.storeMapSnapshot(turn.id);
         await this.deliverTurn(turn.id);
         const wants = JSON.parse(getTurn(db, turn.id)!.delivery_json) as { auto_map?: boolean; auto_diorama?: boolean };
-        if (wants.auto_map) await this.postMap(turn.id);
+        if (wants.auto_map) {
+          // A 3D map waits its turn on the GPU queue (queued before the diorama and picture); the
+          // turn does not wait for it. The flat map is instant.
+          const posting = this.postMap(turn.id);
+          if (!this.deps.diorama) await posting;
+        }
         if (wants.auto_diorama) this.diorama(turn.id);
         this.maybeSummarize(turn.campaign_id);
         if ((JSON.parse(getTurn(db, turn.id)!.delivery_json) as { auto_image?: boolean }).auto_image) this.illustrate(turn.id);
@@ -580,7 +599,7 @@ export class TurnRunner {
             // Paint the reference portrait in the background; illustrations reuse it.
             if (r.characterId) {
               const characterId = r.characterId;
-              // Then its 3D miniature for dioramas (about a minute of GPU time, in the background).
+              // Then its 3D miniature for dioramas (about 3 minutes of GPU time, in the background).
               void this.paintPortrait(campaign.id, characterId).done?.then((p) => {
                 if (p && this.deps.diorama?.miniatures) this.buildMiniature(campaign.id, characterId);
               });
@@ -680,6 +699,34 @@ export class TurnRunner {
       // Post next to the scene it illustrates: its storyline thread, or the main channel.
       const imageChannel = sent.channel_id ?? campaign.channel_id;
       const who = t.actor_character_id ? (getRecord(db, t.campaign_id, t.actor_character_id)?.name ?? 'The party') : 'The party';
+      // Rendered 3D scene (default): the saved models, exact positions, no AI image artifacts.
+      // Any failure falls back to the painted picture below.
+      if (images.config.mode === 'render3d' && this.deps.diorama?.scene) {
+        try {
+          const out = await this.renderScene(t);
+          const id = await this.deps.delivery.send(
+            { channelId: imageChannel, ephemeral: false },
+            { content: `🎬 **${sanitize(who)}** — ${sanitize(t.input_text.length > 140 ? `${t.input_text.slice(0, 140).replace(/\s+\S*$/, '')}…` : t.input_text)}`, file: { name: `scene-${t.id}.png`, path: out.path }, replyTo },
+            0,
+            `img${t.id}`,
+          );
+          setImage({ status: 'done', path: out.path, message_id: id, seconds: out.seconds, mode: 'render3d', summary: out.summary });
+          log.info('image', { turn: t.id, mode: 'render3d', seconds: out.seconds, path: out.path, ...out.summary });
+          return { path: out.path };
+        } catch (err) {
+          if (err instanceof ImageBusyError) {
+            logImageError(turnId, err);
+            setImage({ status: 'failed', error: String((err as Error).message).slice(0, 300) });
+            try {
+              await this.deps.delivery.send({ channelId: imageChannel, ephemeral: false }, { content: "🎨 Couldn't render that scene: the GPU is busy with another job. Try the button again later.", replyTo }, 0, `imgf${t.id}${Date.now() % 1000}`);
+            } catch {
+              /* channel unavailable; the error is logged */
+            }
+            return { error: 'the GPU is busy with another job' };
+          }
+          log.warn('3D scene render failed; painting instead', { turn: t.id, err });
+        }
+      }
       try {
         const seed = (t.id * 7919) % 2_147_483_647;
         const tone = parseConfig(campaign).tone;
@@ -728,7 +775,8 @@ export class TurnRunner {
     if (!job) return { message: '🎨 The painter is busy with several scenes; try again in a minute.', done: null };
     setImage({ status: 'queued' });
     const ahead = images.queue.size - 1;
-    return { message: `🎨 Painting the scene${ahead > 0 ? ` (${ahead} ahead in line)` : ''}… it will appear under the scene shortly.`, done: job };
+    const verb = images.config.mode === 'render3d' && this.deps.diorama?.scene ? '🎬 Rendering the scene in 3D' : '🎨 Painting the scene';
+    return { message: `${verb}${ahead > 0 ? ` (${ahead} ahead in line)` : ''}… it will appear under the scene shortly (the first picture of someone new also builds their 3D model, about 3 minutes).`, done: job };
   }
 
   // ------------------------------------------------------------ portraits
@@ -791,66 +839,103 @@ export class TurnRunner {
 
   // ------------------------------------------------------------ battle maps
 
-  /** Keeps the battle map as it was at this turn, so its Map button shows that moment. */
+  /**
+   * Keeps the battle map as it was at this turn, so its Map, Diorama and Illustrate buttons all show
+   * that moment. A scene without a battle map gets the made-up sketch layout instead.
+   */
   private storeMapSnapshot(turnId: number): void {
     const { db } = this.deps;
     const t = getTurn(db, turnId)!;
     const scene = (t.scene_id ? getRecord(db, t.campaign_id, t.scene_id) : undefined) ?? storylineOf(db, t.campaign_id, t.actor_character_id);
-    const snapshot = mapSnapshot(db, t.campaign_id, scene);
-    if (!snapshot) return;
+    const snapshot = mapSnapshot(db, t.campaign_id, scene) ?? layoutFor(db, t);
     const d = JSON.parse(t.delivery_json) as Record<string, unknown>;
     updateTurn(db, turnId, { delivery_json: JSON.stringify({ ...d, map_snapshot: snapshot }) });
   }
 
-  /** Posts a turn's battle map under its reply (the Map button, or `map:true`). No AI, no GPU. */
+  /**
+   * Draws a battle map PNG at `outPath`. With 3D renders on: a top-down Blender render of the
+   * scene (on the GPU queue, existing miniatures only) with the grid, rings, names and marks drawn
+   * over it. Without them, or when the render fails or the queue is full: the flat SVG map.
+   * The GPU job is queued synchronously, before this returns.
+   */
+  private drawMap(moment: SceneMoment, snapshot: MapSnapshot, outPath: string): Promise<{ path: string; mode: '3d' | 'flat' }> {
+    const dio = this.deps.diorama;
+    const flat = () => ({ path: writeMapPng(snapshot, outPath), mode: 'flat' as const });
+    if (!dio) return Promise.resolve().then(flat);
+    const job = dio.queue.run(async () => {
+      const spec = buildSceneSpec(this.deps.db, moment, (id) => this.miniatureOf(moment.campaign_id, id));
+      const base = await dio.scene.render(spec, outPath.replace(/\.png$/, '-top.png'), { view: 'map', px: MAP_PX });
+      composeMapPng(snapshot, base.path, outPath, MAP_PX);
+      fs.rmSync(base.path, { force: true });
+      log.info('3D map', { scene: snapshot.scene_id, seconds: base.seconds, people: spec.people.length, models: spec.people.filter((p) => p.model).length });
+      return { path: outPath, mode: '3d' as const };
+    });
+    if (!job) {
+      log.info('GPU queue full; drawing the flat map', { scene: snapshot.scene_id });
+      return Promise.resolve().then(flat);
+    }
+    return job.catch((err) => {
+      log.warn('3D map failed; drawing the flat map', { scene: snapshot.scene_id, err });
+      return flat();
+    });
+  }
+
+  /** Posts a turn's battle map under its reply (the Map button, or `map:true`). No AI. */
   async postMap(turnId: number, campaignId?: string): Promise<string> {
     const { db, config } = this.deps;
     const t = getTurn(db, turnId);
-    if (!t || t.mode !== 'play' || (campaignId && t.campaign_id !== campaignId)) return 'That message has no battle map.';
+    if (!t || t.mode !== 'play' || (campaignId && t.campaign_id !== campaignId)) return 'That message has no map.';
     const d = JSON.parse(t.delivery_json) as DeliveryState & { map_snapshot?: MapSnapshot; media?: { map?: { status: string } } };
-    if (!d.map_snapshot) return 'There is no battle map for that scene yet. The GM sets one up when a fight starts or position matters.';
     if (d.media?.map?.status === 'done') return '🗺️ That map is already posted under the scene.';
+    const running = this.mapJobs.get(turnId);
+    if (running) return running;
     const channelId = d.channel_id ?? getCampaign(db, t.campaign_id)!.channel_id;
-    try {
-      const file = writeMapPng(d.map_snapshot, mapPathFor(config.dataDir, t));
-      const id = await this.deps.delivery.send({ channelId, ephemeral: false }, { content: `🗺️ **${sanitize(d.map_snapshot.scene_name)}**`, file: { name: `map-${t.id}.png`, path: file }, replyTo: d.message_ids?.[0] }, 0, `map${t.id}`);
-      const cur = JSON.parse(getTurn(db, turnId)!.delivery_json) as Record<string, unknown>;
-      updateTurn(db, turnId, { delivery_json: JSON.stringify({ ...cur, media: { ...((cur.media as object) ?? {}), map: { status: 'done', message_id: id, path: file } } }) });
-      log.info('map', { turn: t.id, scene: d.map_snapshot.scene_id, tokens: d.map_snapshot.tokens.length, path: file });
-      return '🗺️ Map posted under the scene.';
-    } catch (err) {
-      log.warn('map failed', { turn: t.id, err });
-      return "🗺️ Couldn't draw that map; see the bot log.";
-    }
+    const snapshot = d.map_snapshot ?? layoutFor(db, t);
+    const job = this.drawMap(t, snapshot, mapPathFor(config.dataDir, t))
+      .then(async ({ path: file, mode }) => {
+        const id = await this.deps.delivery.send({ channelId, ephemeral: false }, { content: `🗺️ **${sanitize(snapshot.scene_name)}**`, file: { name: `map-${t.id}.png`, path: file }, replyTo: d.message_ids?.[0] }, 0, `map${t.id}`);
+        const cur = JSON.parse(getTurn(db, turnId)!.delivery_json) as Record<string, unknown>;
+        updateTurn(db, turnId, { delivery_json: JSON.stringify({ ...cur, media: { ...((cur.media as object) ?? {}), map: { status: 'done', message_id: id, path: file, mode } } }) });
+        log.info('map', { turn: t.id, scene: snapshot.scene_id, tokens: snapshot.tokens.length, path: file, mode });
+        return '🗺️ Map posted under the scene.';
+      })
+      .catch((err) => {
+        log.warn('map failed', { turn: t.id, err });
+        return "🗺️ Couldn't draw that map; see the bot log.";
+      })
+      .finally(() => this.mapJobs.delete(turnId));
+    this.mapJobs.set(turnId, job);
+    return job;
   }
 
   /**
-   * Renders a turn's battle map as a 3D diorama in Blender and posts it under the reply (the
-   * Diorama button, or `diorama:true`). `turntable` posts a short rotating video instead.
+   * Renders a turn's scene as a 3D diorama (the same Blender scene as the 🎨 shot, from a raised
+   * 3/4 angle with a floor grid) and posts it under the reply (the Diorama button, or
+   * `diorama:true`). `turntable` posts a short rotating video instead. Existing miniatures only.
    */
   diorama(turnId: number, campaignId?: string, opts: { turntable?: boolean } = {}): { message: string; done: Promise<{ path?: string; error?: string }> | null } {
     const { db, config } = this.deps;
     const dio = this.deps.diorama;
     if (!dio) return { message: '3D dioramas are turned off on this bot.', done: null };
     const t = getTurn(db, turnId);
-    if (!t || t.mode !== 'play' || (campaignId && t.campaign_id !== campaignId)) return { message: 'That message has no battle map.', done: null };
+    if (!t || t.mode !== 'play' || (campaignId && t.campaign_id !== campaignId)) return { message: 'That message has no map.', done: null };
     const d = JSON.parse(t.delivery_json) as DeliveryState & { map_snapshot?: MapSnapshot; media?: { diorama?: { status: string } } };
-    if (!d.map_snapshot) return { message: 'There is no battle map for that scene yet, so there is nothing to build.', done: null };
     if (d.media?.diorama?.status === 'done' && !opts.turntable) return { message: '🧊 That diorama is already posted under the scene.', done: null };
     if (d.media?.diorama?.status === 'queued') return { message: '🧊 Already building that diorama…', done: null };
     const channelId = d.channel_id ?? getCampaign(db, t.campaign_id)!.channel_id;
-    const snapshot = d.map_snapshot;
+    const snapshot = d.map_snapshot ?? layoutFor(db, t);
     const setState = (diorama: Record<string, unknown>) => {
       const cur = JSON.parse(getTurn(db, turnId)!.delivery_json) as Record<string, unknown>;
       updateTurn(db, turnId, { delivery_json: JSON.stringify({ ...cur, media: { ...((cur.media as object) ?? {}), diorama } }) });
     };
     const job = dio.queue.run(async () => {
       try {
-        const out = await dio.renderer.render(this.withMiniatures(t.campaign_id, snapshot), dioramaPathFor(config.dataDir, t), opts.turntable ? { turntable: dioramaPathFor(config.dataDir, t, 'mp4') } : {});
+        const spec = buildSceneSpec(db, getTurn(db, turnId)!, (id) => this.miniatureOf(t.campaign_id, id));
+        const out = await dio.scene.render(spec, dioramaPathFor(config.dataDir, t), { view: 'diorama', ...(opts.turntable ? { turntable: dioramaPathFor(config.dataDir, t, 'mp4') } : {}) });
         const file = out.video ? { name: `diorama-${t.id}.mp4`, path: out.video } : { name: `diorama-${t.id}.png`, path: out.path };
         const id = await this.deps.delivery.send({ channelId, ephemeral: false }, { content: `🧊 **${sanitize(snapshot.scene_name)}**`, file, replyTo: d.message_ids?.[0] }, 0, `dio${t.id}${out.video ? 'v' : ''}`);
         setState({ status: 'done', message_id: id, path: file.path, seconds: out.seconds });
-        log.info('diorama', { turn: t.id, seconds: out.seconds, path: file.path, tokens: snapshot.tokens.length });
+        log.info('diorama', { turn: t.id, seconds: out.seconds, path: file.path, people: spec.people.length, models: spec.people.filter((p) => p.model).length });
         return { path: file.path };
       } catch (err) {
         log.warn('diorama failed', { turn: t.id, err });
@@ -869,11 +954,15 @@ export class TurnRunner {
     return { message: `🧊 Building the diorama${opts.turntable ? ' turntable' : ''}… it will appear under the scene shortly.`, done: job };
   }
 
-  /** The snapshot with each token's 3D miniature (when one is built from its current portrait). */
-  private withMiniatures(campaignId: string, snapshot: MapSnapshot): MapSnapshot & { tokens: (MapSnapshot['tokens'][number] & { model?: string })[] } {
+  /** A storyline's current battle map, or its sketch layout when it has none. */
+  private layoutNow(campaignId: string, scene: RecordRow, actor: string | null): MapSnapshot {
+    return mapSnapshot(this.deps.db, campaignId, scene) ?? layoutFor(this.deps.db, { campaign_id: campaignId, scene_id: scene.id, actor_character_id: actor, delivery_json: '{}', public_reply: '' });
+  }
+
+  /** A record's existing 3D miniature (built from its current portrait), or null. Never builds one. */
+  private miniatureOf(campaignId: string, recordId: string): string | null {
     const style = this.deps.images?.config.style;
-    if (!style) return snapshot;
-    return { ...snapshot, tokens: snapshot.tokens.map((t) => ({ ...t, model: currentMiniature(this.deps.db, campaignId, t.id, style) ?? undefined })) };
+    return style ? currentMiniature(this.deps.db, campaignId, recordId, style) : null;
   }
 
   /**
@@ -893,21 +982,9 @@ export class TurnRunner {
       return { message: `🧊 Already building ${sanitize(record.name)}'s miniature…`, done: this.miniatureJobs.get(recordId)! };
     }
     const setMini = (miniature: NonNullable<PortraitInfo['miniature']>) => savePortrait(db, campaignId, recordId, { miniature });
-    const builder = dio.miniatures;
     const job = dio.queue.run(async () => {
       try {
-        if (!currentPortrait(db, campaignId, recordId, images.config.style)) await this.paintPortraitNow(campaignId, recordId);
-        const portrait = currentPortrait(db, campaignId, recordId, images.config.style);
-        if (!portrait) throw new Error('no portrait to build from');
-        const out = miniaturePathFor(config.dataDir, campaignId, recordId);
-        const r = await builder.build(portrait.path, out, path.join(path.dirname(out), 'logs', recordId));
-        setMini({ status: 'done', path: r.path, portrait_hash: portrait.prompt_hash, seconds: r.seconds });
-        log.info('miniature', { record: recordId, name: record.name, seconds: r.seconds, path: r.path });
-        return r.path;
-      } catch (err) {
-        log.warn('miniature failed', { record: recordId, err });
-        setMini({ status: 'failed', error: String((err as Error).message).slice(0, 300) });
-        return null;
+        return await this.ensureMiniatureNow(campaignId, recordId, !!opts.force);
       } finally {
         this.miniatureJobs.delete(recordId);
       }
@@ -915,23 +992,86 @@ export class TurnRunner {
     if (!job) return { message: '🧊 The GPU queue is full; try again in a minute.', done: null };
     setMini({ status: 'queued' });
     this.miniatureJobs.set(recordId, job);
-    return { message: `🧊 Building ${sanitize(record.name)}'s 3D miniature (about a minute)…`, done: job };
+    return { message: `🧊 Building ${sanitize(record.name)}'s 3D miniature (about 3 minutes)…`, done: job };
   }
 
-  /** `/rpg diorama`: the current battle map of the caller's storyline as a 3D diorama, in its channel. */
+  /**
+   * Renders a play turn as a 3D scene: builds any missing 3D models for the people in focus first
+   * (portrait, then miniature: about 3 minutes each, once), then Blender renders the scene.
+   * Runs inside a job that already holds the GPU queue.
+   */
+  private async renderScene(t: TurnRow): Promise<{ path: string; seconds: number; summary: Record<string, unknown> }> {
+    const { db, config } = this.deps;
+    const images = this.deps.images!;
+    const scene = this.deps.diorama!.scene!;
+    const draft = buildSceneSpec(db, t);
+    // The people in focus first, then one more of those present: everyone gets a model
+    // over time (saved for good), without one picture taking many minutes.
+    let extra = 1; // a model takes about 3 minutes
+    for (const p of [...draft.people.filter((x) => x.focus), ...draft.people.filter((x) => !x.focus)]) {
+      const r = getRecord(db, t.campaign_id, p.id);
+      if (!r || (r.kind !== 'character' && r.kind !== 'npc')) continue;
+      if (!p.focus) {
+        if (extra <= 0 || currentMiniature(db, t.campaign_id, p.id, images.config.style)) continue;
+        extra--;
+      }
+      await this.ensureMiniatureNow(t.campaign_id, p.id);
+    }
+    const spec = buildSceneSpec(db, t, (id) => currentMiniature(db, t.campaign_id, id, images.config.style));
+    const out = await scene.render(spec, imagePathFor(config.dataDir, t), { view: 'shot' });
+    const summary = {
+      people: spec.people.length,
+      models: spec.people.filter((p) => p.model).length,
+      indoor: spec.indoor,
+      floor: spec.floor,
+      wall: spec.wall,
+      time: spec.time,
+      weather: spec.weather,
+    };
+    return { ...out, summary };
+  }
+
+  /** A record's 3D miniature, building it (and its portrait) now if needed. Inside a queued job. */
+  private async ensureMiniatureNow(campaignId: string, recordId: string, force = false): Promise<string | null> {
+    const { db, config } = this.deps;
+    const images = this.deps.images;
+    const builder = this.deps.diorama?.miniatures;
+    if (!images || !builder) return null;
+    const existing = currentMiniature(db, campaignId, recordId, images.config.style);
+    if (existing && !force) return existing;
+    const record = getRecord(db, campaignId, recordId);
+    if (!record || !buildPortraitPrompt(db, record, images.config.style)) return null;
+    try {
+      if (!currentPortrait(db, campaignId, recordId, images.config.style)) await this.paintPortraitNow(campaignId, recordId);
+      const portrait = currentPortrait(db, campaignId, recordId, images.config.style);
+      if (!portrait) throw new Error('no portrait to build from');
+      const out = miniaturePathFor(config.dataDir, campaignId, recordId);
+      const r = await builder.build(portrait.path, out, path.join(path.dirname(out), 'logs', recordId));
+      savePortrait(db, campaignId, recordId, { miniature: { status: 'done', path: r.path, portrait_hash: portrait.prompt_hash, seconds: r.seconds, quality: MINIATURE_QUALITY } });
+      log.info('miniature', { record: recordId, name: record.name, seconds: r.seconds, path: r.path });
+      return r.path;
+    } catch (err) {
+      log.warn('miniature failed', { record: recordId, err });
+      savePortrait(db, campaignId, recordId, { miniature: { status: 'failed', error: String((err as Error).message).slice(0, 300) } });
+      return null;
+    }
+  }
+
+  /** `/rpg diorama`: the current scene of the caller's storyline as a 3D diorama, in its channel. */
   dioramaNow(campaign: CampaignRow, userId: string, characterId?: string, opts: { turntable?: boolean } = {}): { message: string; channelId?: string; done: Promise<unknown> | null } {
     const { db, config } = this.deps;
     const dio = this.deps.diorama;
     if (!dio) return { message: '3D dioramas are turned off on this bot.', done: null };
     const actor = characterId ?? getMember(db, campaign.id, userId)?.character_record_id ?? null;
     const scene = storylineOf(db, campaign.id, actor) ?? mainScene(db, campaign.id);
-    const snapshot = mapSnapshot(db, campaign.id, scene);
-    if (!scene || !snapshot) return { message: 'Your scene has no battle map yet, so there is nothing to build.', done: null };
+    if (!scene) return { message: 'There is no scene to build yet.', done: null };
+    const snapshot = this.layoutNow(campaign.id, scene, actor);
     const channelId = this.channelForScene(campaign, scene.id);
     const base = path.join(config.dataDir, 'images', campaign.id, `diorama-${scene.id}-${Date.now()}`);
     const job = dio.queue.run(async () => {
       try {
-        const out = await dio.renderer.render(this.withMiniatures(campaign.id, snapshot), `${base}.png`, opts.turntable ? { turntable: `${base}.mp4` } : {});
+        const spec = buildSceneSpec(db, momentNow(campaign.id, scene.id, actor, snapshot), (id) => this.miniatureOf(campaign.id, id));
+        const out = await dio.scene.render(spec, `${base}.png`, { view: 'diorama', ...(opts.turntable ? { turntable: `${base}.mp4` } : {}) });
         const file = out.video ? { name: 'diorama.mp4', path: out.video } : { name: 'diorama.png', path: out.path };
         await this.deps.delivery.send({ channelId, ephemeral: false }, { content: `🧊 **${sanitize(snapshot.scene_name)}** (current)`, file }, 0, `dionow${scene.id}${Date.now()}`);
         log.info('diorama', { scene: scene.id, seconds: out.seconds, path: file.path, by: userId });
@@ -953,13 +1093,14 @@ export class TurnRunner {
     const member = getMember(db, campaign.id, userId);
     const actor = characterId ?? member?.character_record_id ?? null;
     const scene = storylineOf(db, campaign.id, actor) ?? mainScene(db, campaign.id);
-    const snapshot = mapSnapshot(db, campaign.id, scene);
-    if (!scene || !snapshot) return { message: 'Your scene has no battle map yet. The GM sets one up when a fight starts or position matters.' };
+    if (!scene) return { message: 'There is no scene to map yet.' };
+    const snapshot = this.layoutNow(campaign.id, scene, actor);
     const channelId = this.channelForScene(campaign, scene.id);
     try {
-      const file = writeMapPng(snapshot, path.join(config.dataDir, 'images', campaign.id, `map-${scene.id}-${Date.now()}.png`));
+      const outPath = path.join(config.dataDir, 'images', campaign.id, `map-${scene.id}-${Date.now()}.png`);
+      const { path: file, mode } = await this.drawMap(momentNow(campaign.id, scene.id, actor, snapshot), snapshot, outPath);
       await this.deps.delivery.send({ channelId, ephemeral: false }, { content: `🗺️ **${sanitize(snapshot.scene_name)}** (current)`, file: { name: 'map.png', path: file } }, 0, `mapnow${scene.id}${Date.now()}`);
-      log.info('map', { scene: scene.id, tokens: snapshot.tokens.length, path: file, by: userId });
+      log.info('map', { scene: scene.id, tokens: snapshot.tokens.length, path: file, mode, by: userId });
       return { message: '🗺️ Map posted.', channelId };
     } catch (err) {
       log.warn('map failed', { scene: scene.id, err });
@@ -983,6 +1124,8 @@ export class TurnRunner {
     const scene = storylineOf(db, t.campaign_id, t.actor_character_id);
     const d = JSON.parse(t.delivery_json) as DeliveryState & { redirect_from?: string; message_ids?: string[] };
     if (!scene || d.message_ids?.length) return;
+    // The turn belongs to the storyline the actor ended up in (its header, history and buttons).
+    if (scene.id !== t.scene_id) updateTurn(db, turnId, { scene_id: scene.id });
     const channel = this.channelForScene(campaign, scene.id);
     if (channel === d.channel_id) return;
     const from = d.redirect_from ?? d.channel_id;
@@ -1001,6 +1144,7 @@ export class TurnRunner {
   private creating = new Set<string>();
   private portraitJobs = new Map<string, Promise<PortraitInfo | null>>();
   private miniatureJobs = new Map<string, Promise<string | null>>();
+  private mapJobs = new Map<number, Promise<string>>();
 
   /**
    * After a world change: open a persistent thread for every new side storyline that has player
@@ -1019,22 +1163,21 @@ export class TurnRunner {
 
     for (const scene of scenes) {
       const players = participants(scene).filter((p) => pcs.has(p));
-      if (!players.length || isMain(db, scene) || threadFor(db, campaignId, scene.id) || this.creating.has(scene.id) || !delivery.createThread) continue;
-      this.creating.add(scene.id);
-      try {
-        const wantsPrivate = sceneData(scene).private === true || !!(turn && (JSON.parse(turn.delivery_json) as { private_story?: boolean }).private_story);
-        const members = [...new Set([...players.map((p) => owners.get(p)).filter((x): x is string => !!x), campaign.owner_user_id])];
-        const threadId = await delivery.createThread(campaign.channel_id, scene.name.slice(0, 95), wantsPrivate, members);
-        saveThread(db, campaignId, scene.id, { thread_id: threadId, private: wantsPrivate, archived: false });
-        const who = players.map(nameOf).join(', ');
-        log.info('storyline thread created', { campaign: campaignId, scene: scene.id, name: scene.name, thread: threadId, private: wantsPrivate, players: who });
-        await this.safeSend(threadId, `🧵 **${sanitize(scene.name)}** — ${sanitize(who)}'s storyline continues here, alongside the main story. Use \`/rpg play\` in this thread.`);
-        if (!wantsPrivate) await this.safeSend(campaign.channel_id, `↪ ${sanitize(who)}'s story continues in <#${threadId}>`);
-      } catch (err) {
-        log.warn('storyline thread creation failed', { scene: scene.id, err });
-      } finally {
-        this.creating.delete(scene.id);
+      if (!players.length || isMain(db, scene)) continue;
+      const link = threadFor(db, campaignId, scene.id);
+      if (link?.thread_id && !link.archived) {
+        // Characters who joined this storyline join its thread.
+        const want = [...new Set(players.map((p) => owners.get(p)).filter((x): x is string => !!x))];
+        const missing = want.filter((u) => !(link.members ?? []).includes(u));
+        if (missing.length && delivery.addThreadMember) {
+          for (const u of missing) await delivery.addThreadMember(link.thread_id, u).catch((err: unknown) => log.warn('thread member add failed', { thread: link.thread_id, err }));
+          saveThread(db, campaignId, scene.id, { members: [...(link.members ?? []), ...missing] });
+        }
+        continue;
       }
+      // Side threads are opt-in: the player asked with side:true, or someone pressed 🧵 Side thread.
+      const asked = !!turn && !!(JSON.parse(turn.delivery_json) as { side_story?: boolean }).side_story && !!turn.actor_character_id && participants(scene).includes(turn.actor_character_id);
+      if (asked || link?.requested) await this.openSideThread(campaign, scene);
     }
 
     // Threads of storylines that ended, were archived, or lost every player character.
@@ -1067,6 +1210,125 @@ export class TurnRunner {
       saveThread(db, campaignId, scene.id, { notified_busy_until: busy });
       log.info('storyline ready', { campaign: campaignId, scene: scene.id, busy_until_min: busy, world });
     }
+  }
+
+  /** Opens (once) the public side thread of a storyline, with its players as members. */
+  private async openSideThread(campaign: CampaignRow, scene: RecordRow): Promise<string | null> {
+    const { db } = this.deps;
+    const delivery = this.deps.delivery;
+    const existing = threadFor(db, campaign.id, scene.id);
+    if (existing?.thread_id && !existing.archived) return existing.thread_id;
+    if (!delivery.createThread || this.creating.has(scene.id)) return null;
+    this.creating.add(scene.id);
+    try {
+      const owners = playerCharacterOwners(db, campaign.id);
+      const players = participants(scene).filter((p) => owners.has(p));
+      const members = [...new Set(players.map((p) => owners.get(p)!))];
+      const threadId = await delivery.createThread(campaign.channel_id, scene.name.slice(0, 95), false, [...new Set([...members, campaign.owner_user_id])]);
+      saveThread(db, campaign.id, scene.id, { thread_id: threadId, private: false, archived: false, members, requested: true });
+      const who = players.map((p) => getRecord(db, campaign.id, p)?.name ?? 'someone').join(', ');
+      log.info('storyline thread created', { campaign: campaign.id, scene: scene.id, name: scene.name, thread: threadId, players: who });
+      await this.safeSend(threadId, `🧵 **${sanitize(scene.name)}** — ${sanitize(who)}'s side story continues here, alongside the main story. Use \`/rpg play\` in this thread; anyone whose character comes here joins it.`);
+      await this.safeSend(campaign.channel_id, `↪ ${sanitize(who)}'s side story continues in <#${threadId}>`);
+      return threadId;
+    } catch (err) {
+      log.warn('storyline thread creation failed', { scene: scene.id, err });
+      return null;
+    } finally {
+      this.creating.delete(scene.id);
+    }
+  }
+
+  /** The 🧵 Side thread button: moves a side storyline into its own thread. */
+  async requestSideThread(turnId: number, userId: string, campaignId: string): Promise<string> {
+    const { db } = this.deps;
+    const t = getTurn(db, turnId);
+    const campaign = getCampaign(db, campaignId);
+    if (!t || !campaign || t.campaign_id !== campaignId || !t.scene_id) return 'That message is not part of a side story.';
+    const scene = getRecord(db, campaignId, t.scene_id);
+    if (!scene || isMain(db, scene) || !isActiveScene(scene)) return 'That side story has ended or rejoined the main story.';
+    const owners = playerCharacterOwners(db, campaignId);
+    const mine = participants(scene).some((p) => owners.get(p) === userId);
+    if (!mine && !isOwner(campaign, userId)) return 'Only the players in that side story (or the campaign owner) can move it into a thread.';
+    const live = threadFor(db, campaignId, scene.id);
+    if (live?.thread_id && !live.archived) return `It already has a thread: <#${live.thread_id}>`;
+    saveThread(db, campaignId, scene.id, { requested: true });
+    const id = await this.openSideThread(campaign, scene);
+    return id ? `🧵 Moved to <#${id}>.` : "Couldn't open a thread here (check the bot's Create Public Threads permission).";
+  }
+
+  /**
+   * `/rpg merge`: a side storyline that turned out to be where the story went becomes the main
+   * storyline again. Its thread is closed and its turns post in the campaign channel; the old main
+   * storyline (if anyone is still there) becomes a side story that can get its own 🧵 thread.
+   */
+  async mergeToMain(campaign: CampaignRow, userId: string, channelId: string, characterId?: string): Promise<string> {
+    const { db } = this.deps;
+    const viaThread = (db.prepare(`SELECT name FROM records WHERE campaign_id = ? AND kind = '_discord_thread' AND json_extract(data_json, '$.thread_id') = ?`).get(campaign.id, channelId) as
+      | { name: string }
+      | undefined)?.name;
+    const owners = playerCharacterOwners(db, campaign.id);
+    const actor = characterId ?? getMember(db, campaign.id, userId)?.character_record_id ?? null;
+    const scene = viaThread ? getRecord(db, campaign.id, viaThread) : storylineOf(db, campaign.id, actor);
+    if (!scene || !isActiveScene(scene)) return 'That storyline has ended; there is nothing to merge.';
+    const mine = participants(scene).some((p) => owners.get(p) === userId);
+    if (!mine && !isOwner(campaign, userId)) return 'Only the players in that storyline (or the campaign owner) can merge it into the main channel.';
+    const oldMain = mainScene(db, campaign.id);
+    const link = threadFor(db, campaign.id, scene.id);
+    if (oldMain?.id === scene.id && !(link?.thread_id && !link.archived)) return 'That storyline is already the main story in the main channel.';
+
+    // Exactly one scene carries the `main` flag.
+    const ts = nowIso();
+    for (const s of activeScenes(db, campaign.id)) {
+      const d = sceneData(s) as Record<string, unknown>;
+      const want = s.id === scene.id;
+      if ((d.main === true) === want) continue;
+      const { main: _m, ...rest } = d;
+      db.prepare('UPDATE records SET data_json = ?, version = version + 1, updated_at = ? WHERE id = ?').run(JSON.stringify(want ? { ...rest, main: true } : rest), ts, s.id);
+    }
+    const who = participants(scene)
+      .filter((p) => owners.has(p))
+      .map((p) => getRecord(db, campaign.id, p)?.name ?? 'someone')
+      .join(', ');
+    if (link?.thread_id && !link.archived) {
+      await this.safeSend(link.thread_id, `↩️ **${sanitize(scene.name)}** continues in the main channel: <#${campaign.channel_id}>. This thread stays here as a record.`);
+      try {
+        await this.deps.delivery.archiveThread?.(link.thread_id);
+      } catch (err) {
+        log.warn('storyline thread archive failed', { scene: scene.id, err });
+      }
+    }
+    if (link) saveThread(db, campaign.id, scene.id, { archived: true, requested: false });
+    const left = oldMain && oldMain.id !== scene.id ? participants(oldMain).filter((p) => owners.has(p)) : [];
+    const leftNote = left.length
+      ? ` ${sanitize(left.map((p) => getRecord(db, campaign.id, p)?.name ?? 'someone').join(', '))} ${left.length > 1 ? 'are' : 'is'} still in **${sanitize(oldMain!.name)}**, now a side story (🧵 under its next reply gives it a thread).`
+      : '';
+    await this.announce(campaign, `↩️ **${sanitize(scene.name)}**${who ? ` (${sanitize(who)})` : ''} is the main story now and continues here.${leftNote}`);
+    log.info('storyline merged to main', { campaign: campaign.id, scene: scene.id, old_main: oldMain?.id, thread: link?.thread_id });
+    return `↩️ Merged: **${sanitize(scene.name)}** now plays in <#${campaign.channel_id}>.`;
+  }
+
+  /** A whispered turn is answered in the actor's private thread with the DM (created on first use). */
+  private async routeToPrivateThread(turnId: number): Promise<void> {
+    const { db } = this.deps;
+    const t = getTurn(db, turnId)!;
+    const campaign = getCampaign(db, t.campaign_id)!;
+    const d = JSON.parse(t.delivery_json) as DeliveryState & Record<string, unknown>;
+    let link = privateThreadFor(db, campaign.id, t.actor_user_id);
+    if (!link?.thread_id && this.deps.delivery.createThread) {
+      try {
+        const who = (t.actor_character_id ? getRecord(db, campaign.id, t.actor_character_id)?.name : null) ?? 'You';
+        const threadId = await this.deps.delivery.createThread(campaign.channel_id, `🤫 ${who} & the DM`.slice(0, 95), true, [t.actor_user_id]);
+        savePrivateThread(db, campaign.id, t.actor_user_id, threadId);
+        await this.safeSend(threadId, '🤫 Your private thread with the DM. Thoughts, secret questions and quiet actions go here: use `/rpg play` in this thread (or `private:true` anywhere). Nobody else at the table can read it.');
+        log.info('private thread created', { campaign: campaign.id, user: t.actor_user_id, thread: threadId });
+        link = privateThreadFor(db, campaign.id, t.actor_user_id);
+      } catch (err) {
+        log.warn('private thread creation failed', { turn: turnId, err });
+      }
+    }
+    if (!link?.thread_id || d.channel_id === link.thread_id) return;
+    updateTurn(db, turnId, { delivery_json: JSON.stringify({ ...d, channel_id: link.thread_id, redirect_from: d.channel_id }) });
   }
 
   private async safeSend(channelId: string, content: string): Promise<void> {
@@ -1102,6 +1364,13 @@ export class TurnRunner {
       if ((JSON.parse(turn.delivery_json) as { map_snapshot?: unknown }).map_snapshot) buttons.push({ customId: `rpg:map:${turn.id}:0`, label: '🗺️ Map', style: 'secondary' });
       if (this.deps.images) buttons.push({ customId: `rpg:img:${turn.id}:0`, label: '🎨 Illustrate', style: 'secondary' });
       if (this.deps.diorama && buttons.some((b) => b.customId.startsWith('rpg:map:'))) buttons.push({ customId: `rpg:dio:${turn.id}:0`, label: '🧊 Diorama', style: 'secondary' });
+      // A side storyline still posting in the main channel can be moved into its own thread.
+      const sideScene = turn.scene_id ? getRecord(this.deps.db, turn.campaign_id, turn.scene_id) : undefined;
+      const live = sideScene ? threadFor(this.deps.db, turn.campaign_id, sideScene.id) : undefined;
+      const whispered = !!(JSON.parse(turn.delivery_json) as { whisper?: boolean }).whisper;
+      if (sideScene && !whispered && this.deps.delivery.createThread && !isMain(this.deps.db, sideScene) && !(live?.thread_id && !live.archived)) {
+        buttons.push({ customId: `rpg:side:${turn.id}:0`, label: '🧵 Side thread', style: 'primary' });
+      }
       if (buttons.length) out[out.length - 1]!.buttons = buttons;
       return out;
     }
@@ -1150,7 +1419,13 @@ export class TurnRunner {
     const from = (d as { redirect_from?: string }).redirect_from;
     if (from && !(d as { pointer_sent?: boolean }).pointer_sent && rendered.length) {
       try {
-        await this.deps.delivery.send({ channelId: from, interaction: d.interaction, ephemeral: false }, { content: `↪ Continued in <#${target.channelId}>` }, 0, `p${turnId}`);
+        const whisper = !!(d as { whisper?: boolean }).whisper;
+        await this.deps.delivery.send(
+          { channelId: from, interaction: d.interaction, ephemeral: whisper },
+          { content: whisper ? `🤫 Answered in your private thread with the DM: <#${target.channelId}>` : `↪ Continued in <#${target.channelId}>` },
+          0,
+          `p${turnId}`,
+        );
       } catch (err) {
         log.warn('storyline pointer failed', { turn: turnId, err });
       }

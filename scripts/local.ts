@@ -10,9 +10,10 @@ import { Semaphore, effectiveBudget } from '../src/agent.js';
 import { createCampaign, setLifecycle, WorkflowError } from '../src/campaign.js';
 import { loadConfig } from '../src/config.js';
 import { acquireInstanceLock, getCampaignByChannel, getMember, openDatabase, parseConfig, projectRoot } from '../src/database.js';
+import { migrateSceneMaps } from '../src/maps.js';
 import { configureLog, configureLogFile } from '../src/log.js';
 import { createProvider } from '../src/providers.js';
-import { createDioramaRenderer, createMiniatureBuilder, loadDioramaConfig } from '../src/diorama.js';
+import { createMiniatureBuilder, createSceneRenderer, loadDioramaConfig } from '../src/diorama.js';
 import { createWorkshopGenerator, ImageQueue, loadImageConfig } from '../src/images.js';
 import { exec } from 'node:child_process';
 import { renderSheet, renderUsage } from '../src/render.js';
@@ -33,6 +34,8 @@ configureLog('info', []);
 configureLogFile(path.join(dataDir, 'logs'));
 const releaseLock = acquireInstanceLock(dataDir);
 const db = openDatabase(config.databasePath);
+// Battle maps used to live on scenes; they belong to places now.
+migrateSceneMaps(db);
 const provider = createProvider(config);
 
 let buttons: Button[] = [];
@@ -62,7 +65,7 @@ const delivery: DeliveryPort = {
 };
 const imageConfig = loadImageConfig();
 const dioramaConfig = loadDioramaConfig();
-// Paintings and dioramas share one GPU queue: one heavy job at a time.
+// Paintings and 3D renders (scene, diorama, map) share one GPU queue: one heavy job at a time.
 const gpuQueue = new ImageQueue(imageConfig.maxQueue);
 const runner = new TurnRunner({
   db,
@@ -71,7 +74,7 @@ const runner = new TurnRunner({
   delivery,
   modelLimiter: new Semaphore(1),
   images: imageConfig.enabled ? { generator: createWorkshopGenerator(imageConfig), queue: gpuQueue, config: imageConfig } : undefined,
-  diorama: dioramaConfig.enabled ? { renderer: createDioramaRenderer(dioramaConfig), queue: gpuQueue, miniatures: createMiniatureBuilder(dioramaConfig) } : undefined,
+  diorama: dioramaConfig.enabled ? { queue: gpuQueue, miniatures: createMiniatureBuilder(dioramaConfig), scene: createSceneRenderer(dioramaConfig) } : undefined,
 });
 
 let campaign = getCampaignByChannel(db, GUILD, CHANNEL);
@@ -100,6 +103,7 @@ Commands (anything without a command word is a play action):
   ask <question>     rules/world question, changes nothing
   sheet              your character sheet and inventory
   recap              story so far
+  merge              make your storyline the main story in the main channel
   as <name>          switch to another player (e.g. "as bob"); "as you" switches back to the owner
   gm <instruction>   owner correction or world advance (preview, then confirm)
   configure <text>   owner configuration draft
@@ -120,6 +124,10 @@ async function handle(line: string): Promise<boolean> {
     if (!b) return void console.log('No such button.'), true;
     const [, kind, id, nonce] = b.customId.split(':');
     buttons = [];
+    if (kind === 'side') {
+      console.log(await runner.requestSideThread(Number(id), user, campaign.id));
+      return true;
+    }
     if (kind === 'map') {
       console.log(await runner.postMap(Number(id), campaign.id));
       return true;
@@ -160,6 +168,9 @@ async function handle(line: string): Promise<boolean> {
       return true;
     case 'usage':
       console.log(renderUsage(db, campaign, effectiveBudget(config, parseConfig(campaign), false)));
+      return true;
+    case 'merge':
+      console.log(await runner.mergeToMain(campaign, user, CHANNEL));
       return true;
     case 'backup':
       console.log(await runner.backup(campaign, user));

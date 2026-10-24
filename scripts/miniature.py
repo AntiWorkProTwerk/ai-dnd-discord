@@ -26,9 +26,12 @@ def main() -> int:
     p.add_argument('--out', required=True)
     p.add_argument('--work', required=True, help='folder for the saved graph, history and job files')
     p.add_argument('--seed', type=int, default=11)
-    p.add_argument('--triangles', type=int, default=12000)
-    p.add_argument('--resolution', type=int, default=512, choices=[512, 1024])
-    p.add_argument('--texture', type=int, default=512)
+    # TRELLIS.2 at 1024 with 2048 textures: about 3 minutes on a 12 GB card, and a face you can
+    # recognize (512/512 Pixal3D gave a smeared mask). Built once per character and portrait.
+    p.add_argument('--triangles', type=int, default=40000)
+    p.add_argument('--resolution', type=int, default=1024, choices=[512, 1024])
+    p.add_argument('--texture', type=int, default=2048)
+    p.add_argument('--backend', default='trellis2', choices=['pixal3d', 'trellis2'])
     a = p.parse_args()
     started = time.monotonic()
     image = Path(a.image).resolve()
@@ -49,13 +52,14 @@ def main() -> int:
             module.start()
             schemas = module.api('/object_info')
             uploaded = module.upload(image)
-            settings = dict(image=uploaded, seed=a.seed, backend='pixal3d', resolution=a.resolution, texture=a.texture, triangles=a.triangles)
+            settings = dict(image=uploaded, seed=a.seed, backend=a.backend, resolution=a.resolution, texture=a.texture, triangles=a.triangles)
             try:
                 result = module.run_graph(module.workflows.generate(schemas, **settings), work, 'miniature')
             except RuntimeError as exc:
                 if not any(t in str(exc).lower() for t in ('out of memory', 'outofmemory', 'cuda error: memory')):
                     raise
-                settings.update(resolution=512, texture=256, triangles=min(a.triangles, 8000))
+                # Out of memory: the lighter backend at its default geometry, still with usable textures.
+                settings.update(backend='pixal3d', resolution=512, texture=1024, triangles=min(a.triangles, 20000))
                 result = module.run_graph(module.workflows.generate(schemas, **settings), work, 'miniature-retry')
         with tempfile.TemporaryDirectory() as tmp:
             files = module.copy_outputs(result, Path(tmp), {'.glb'})

@@ -25,6 +25,8 @@ export interface ImageConfig {
   steps: number;
   /** `portraits`: pass the focus characters' portraits as reference images (IMAGE_REFERENCES). */
   references: 'off' | 'portraits';
+  /** `render3d`: 🎨 renders the scene in Blender with the saved 3D models; `paint`: FLUX painting (IMAGE_MODE). */
+  mode: 'render3d' | 'paint';
 }
 
 export function loadImageConfig(env: NodeJS.ProcessEnv = process.env): ImageConfig {
@@ -45,6 +47,7 @@ export function loadImageConfig(env: NodeJS.ProcessEnv = process.env): ImageConf
     // FLUX.2 Klein is tuned for 4 steps; 8 measurably improved figure coherence for ~1-2 s more.
     steps: num(env.IMAGE_STEPS, 8),
     references: (env.IMAGE_REFERENCES ?? 'portraits').trim().toLowerCase() === 'off' ? 'off' : 'portraits',
+    mode: (env.IMAGE_MODE ?? 'render3d').trim().toLowerCase() === 'paint' ? 'paint' : 'render3d',
   };
 }
 
@@ -222,18 +225,18 @@ const lowerArticle = (s: string) => s.replace(/^(a|an|the)\s+/i, (m) => m.toLowe
 const listJoin = (xs: string[]) => (xs.length <= 1 ? (xs[0] ?? '') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
 
 /** The storyline (scene record) the turn was played in. */
-function sceneFor(db: Db, turn: TurnRow, actor: RecordRow | undefined): RecordRow | undefined {
+export function sceneFor(db: Db, turn: Pick<TurnRow, 'campaign_id' | 'scene_id'>, actor: RecordRow | undefined): RecordRow | undefined {
   const byTurn = turn.scene_id ? getRecord(db, turn.campaign_id, turn.scene_id) : undefined;
   return byTurn ?? (actor ? storylineOf(db, turn.campaign_id, actor.id) : undefined);
 }
 
-function isFight(scene: RecordRow | undefined): boolean {
+export function isFight(scene: RecordRow | undefined): boolean {
   const d = publicData(scene);
   if (!d) return false;
   return (Array.isArray(d.initiative) && d.initiative.length > 1) || (typeof d.round === 'number' && d.round > 0) || d.combat === true;
 }
 
-interface CastMember {
+export interface CastMember {
   record: RecordRow;
   label: string;
   /** Visible state: wounds, simple conditions, carried items, weapon in hand. */
@@ -245,7 +248,7 @@ interface CastMember {
  * "the hero", other player characters "the companion" (or "the first/second companion"), others
  * their role.
  */
-function castOf(db: Db, campaignId: string, scene: RecordRow | undefined, actor: RecordRow | undefined): CastMember[] {
+export function castOf(db: Db, campaignId: string, scene: RecordRow | undefined, actor: RecordRow | undefined): CastMember[] {
   const d = publicData(scene);
   const ids = [...new Set([...(actor ? [actor.id] : []), ...(d && Array.isArray(d.participants_ids) ? (d.participants_ids as unknown[]).filter((x): x is string => typeof x === 'string') : [])])];
   const rows = ids.map((id) => getRecord(db, campaignId, id)).filter((r): r is RecordRow => !!r && !r.archived_at && !!publicData(r));
@@ -313,7 +316,8 @@ export function buildScenePlan(db: Db, turn: TurnRow, style: string, tone = '', 
   const story = sceneFor(db, turn, actor);
   const cast = castOf(db, turn.campaign_id, story, actor);
   const stored = (JSON.parse(turn.delivery_json || '{}') as { map_snapshot?: MapSnapshot }).map_snapshot;
-  const snapshot = stored ?? mapSnapshot(db, turn.campaign_id, story);
+  // A made-up sketch places nobody: only a real battle map gives the painting a composition.
+  const snapshot = (stored?.sketch ? null : stored) ?? mapSnapshot(db, turn.campaign_id, story);
   const labels = new Map(cast.map((c) => [c.record.id, c.label]));
   if (actor) labels.set(actor.id, 'the hero');
   const names = namer(db, turn.campaign_id, labels);
@@ -329,7 +333,7 @@ export function buildScenePlan(db: Db, turn: TurnRow, style: string, tone = '', 
   let scene = visual(turn);
   if (!scene && story) {
     const earlier = db
-      .prepare(`SELECT public_reply FROM turns WHERE campaign_id = ? AND scene_id = ? AND mode = 'play' AND id < ? AND status IN ('committed', 'delivered') ORDER BY id DESC LIMIT 3`)
+      .prepare(`SELECT public_reply FROM turns WHERE campaign_id = ? AND scene_id = ? AND mode = 'play' AND id < ? AND status IN ('committed', 'delivered') AND json_extract(delivery_json, '$.whisper') IS NULL ORDER BY id DESC LIMIT 3`)
       .all(turn.campaign_id, story.id, turn.id) as Pick<TurnRow, 'public_reply'>[];
     scene = earlier.map(visual).find(Boolean) ?? '';
   }
@@ -395,7 +399,7 @@ export function buildScenePlan(db: Db, turn: TurnRow, style: string, tone = '', 
 }
 
 /** At most three people in focus: fewer figures means fewer anatomy errors and swapped faces. */
-function focusOf(cast: CastMember[], actor: RecordRow | undefined, scene: RecordRow | undefined, snapshot: MapSnapshot | null | undefined, narration: string): string[] {
+export function focusOf(cast: CastMember[], actor: RecordRow | undefined, scene: RecordRow | undefined, snapshot: MapSnapshot | null | undefined, narration: string): string[] {
   const out: string[] = [];
   const add = (id: string | undefined) => {
     if (id && !out.includes(id) && out.length < MAX_FOCUS && cast.some((c) => c.record.id === id)) out.push(id);

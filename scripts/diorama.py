@@ -1,9 +1,10 @@
-"""Renders a battle map diorama with Blender under the local pipeline's shared GPU lock.
+"""Renders the 3D scene (scripts/scene_blender.py) with Blender under the local pipeline's shared GPU lock: the
+cinematic shot, the diorama (--view diorama, optionally --turntable) or the top-down map (--view map).
 
 Run with the 2D workshop's interpreter (it provides the lock and the ComfyUI client):
   D:/Godot/local-2d-pipeline/.venv/Scripts/python.exe scripts/diorama.py \
     --pipeline-root D:/Godot/local-2d-pipeline --blender "C:/.../blender.exe" \
-    --scene snapshot.json --out diorama.png [--turntable diorama.mp4]
+    --scene spec.json --out out.png [--view shot|diorama|map] [--px 96] [--turntable diorama.mp4]
 
 ComfyUI's models are unloaded first when it is idle, so Blender has the VRAM. Prints one JSON line.
 """
@@ -28,6 +29,9 @@ def main() -> int:
     p.add_argument('--engine', default='eevee')
     p.add_argument('--turntable', default=None)
     p.add_argument('--timeout', type=int, default=300)
+    p.add_argument('--script', default='scene_blender.py', choices=['scene_blender.py'])
+    p.add_argument('--view', default='shot', choices=['shot', 'diorama', 'map'])
+    p.add_argument('--px', type=int, default=None)
     a = p.parse_args()
     started = time.monotonic()
     sys.path.insert(0, str(Path(a.pipeline_root)))
@@ -42,8 +46,10 @@ def main() -> int:
             if not queue.get('queue_running') and not queue.get('queue_pending'):
                 module.api('/free', {'unload_models': True, 'free_memory': True})
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-        cmd = [a.blender, '--background', '--factory-startup', '--python-exit-code', '1', '--python', str(HERE / 'diorama_blender.py'), '--',
-               '--scene', a.scene, '--out', a.out, '--engine', a.engine]
+        cmd = [a.blender, '--background', '--factory-startup', '--python-exit-code', '1', '--python', str(HERE / a.script), '--',
+               '--scene', a.scene, '--out', a.out, '--engine', a.engine, '--view', a.view]
+        if a.px:
+            cmd += ['--px', str(a.px)]
         if a.turntable:
             cmd += ['--turntable', a.turntable]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))

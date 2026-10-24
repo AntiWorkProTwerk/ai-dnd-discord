@@ -29,7 +29,7 @@ describe('commands', () => {
   it('registers one /rpg command with every subcommand, guild-only', () => {
     const [cmd] = buildCommands();
     const subs = (cmd!.options ?? []).map((o) => o.name).sort();
-    expect(subs).toEqual(['ask', 'backup', 'character', 'configure', 'diorama', 'gm', 'import', 'map', 'pause', 'play', 'portrait', 'recap', 'resume', 'setup', 'sheet', 'start', 'undo', 'usage']);
+    expect(subs).toEqual(['ask', 'backup', 'character', 'configure', 'diorama', 'gm', 'import', 'map', 'merge', 'pause', 'play', 'portrait', 'recap', 'resume', 'setup', 'sheet', 'start', 'undo', 'usage']);
     expect(cmd!.contexts).toEqual([0]);
     expect(cmd!.default_member_permissions ?? null).toBeNull();
   });

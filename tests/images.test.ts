@@ -13,6 +13,7 @@ import type { ModelProvider, ProviderRequest, ProviderResponse } from '../src/pr
 import { planBatch, writeBatch } from '../src/records.js';
 import { TurnRunner, type DeliveryPort, type DeliveryTarget, type OutboundMessage } from '../src/turns.js';
 import type { CampaignRow } from '../src/types.js';
+import type { SceneSpec } from '../src/scene3d.js';
 
 const op = (o: Record<string, unknown>) => ({
   ref: null, record_id: null, kind: null, name: null, parent_id: null, visibility: null, path: null,
@@ -49,7 +50,10 @@ let refsSeen: string[][];
 let fail: Error | null;
 
 let built: string[];
+let scenes: SceneSpec[];
+let sceneFail: Error | null;
 let rendered: { model?: string }[][];
+let views: string[];
 
 function runnerWith(images = true, max = 4, dioramas = false) {
   const config = loadConfig({ DATA_DIR: dir, LLM_PROVIDER: 'ollama' });
@@ -66,19 +70,25 @@ function runnerWith(images = true, max = 4, dioramas = false) {
   };
   const queue = new ImageQueue(max);
   built = [];
+  scenes = [];
+  sceneFail = null;
   rendered = [];
+  views = [];
   return new TurnRunner({
     db, config, provider: new OneShotProvider(), delivery, modelLimiter: new Semaphore(1),
     images: images ? { generator, queue, config: loadImageConfig({ IMAGE_GENERATION: 'comfy' }) } : undefined,
     diorama: dioramas
       ? {
           queue,
-          renderer: {
-            async render(snapshot, out) {
-              rendered.push((snapshot.tokens as { model?: string }[]).map((t) => ({ model: t.model })));
+          scene: {
+            async render(spec, out, opts) {
+              if (sceneFail) throw sceneFail;
+              views.push(opts?.view ?? 'shot');
+              if (opts?.view === 'diorama') rendered.push(spec.people.map((p) => ({ model: p.model })));
+              else scenes.push(spec);
               fs.mkdirSync(path.dirname(out), { recursive: true });
               fs.writeFileSync(out, 'png');
-              return { path: out, video: null, seconds: 1 };
+              return { path: out, video: null, seconds: 2 };
             },
           },
           miniatures: {
@@ -94,6 +104,10 @@ function runnerWith(images = true, max = 4, dioramas = false) {
   });
 }
 
+const CHAPEL_MAP = { cols: 10, rows: 8, cell_ft: 5, features: [{ kind: 'object', label: 'altar', x: 4, y: 0, w: 2, h: 1 }] };
+/** Puts a record on its place's map (bypassing validation). */
+const setPos = (id: string, pos: object) => db.prepare(`UPDATE records SET data_json = json_set(data_json, '$.pos', json(?)) WHERE id = ?`).run(JSON.stringify(pos), id);
+
 const target = (): DeliveryTarget => ({ channelId: 'c', ephemeral: false, interaction: { application_id: 'a', token: 't', created_at: new Date().toISOString() } });
 
 beforeEach(() => {
@@ -105,8 +119,9 @@ beforeEach(() => {
   campaign = createCampaign(db, { guildId: 'g', channelId: 'c', ownerUserId: 'o', title: 'T', premise: '', rules_edition: '', tone: 'grim', max_players: 4, boundaries: '', require_character_approval: false });
   db.transaction(() => {
     const plan = planBatch(db, [
-      op({ op: 'create', ref: '$room', kind: 'location', name: 'Cray Chapel', data_json: '{"description":"A flooded stone chapel"}', gm_notes_json: '{"secret":"The reeve hid the bell clapper here"}' }),
-      op({ op: 'create', ref: '$pc', kind: 'character', name: 'Borin', parent_id: '$room', data_json: '{"appearance":"stocky dwarf with a red beard"}' }),
+      // Every place anyone plays in has a saved map, and everyone there a position on it.
+      op({ op: 'create', ref: '$room', kind: 'location', name: 'Cray Chapel', data_json: JSON.stringify({ description: 'A flooded stone chapel', map: CHAPEL_MAP }), gm_notes_json: '{"secret":"The reeve hid the bell clapper here"}' }),
+      op({ op: 'create', ref: '$pc', kind: 'character', name: 'Borin', parent_id: '$room', data_json: JSON.stringify({ appearance: 'stocky dwarf with a red beard', pos: { x: 4, y: 7 } }) }),
       op({ op: 'create', ref: '$vault', kind: 'location', name: 'Secret Vault', parent_id: '$room', visibility: 'gm', data_json: '{"description":"hidden treasure vault"}' }),
     ] as never, { campaignId: campaign.id, actorUserId: 'o', constraints: [] });
     writeBatch(db, campaign.id, plan);
@@ -188,7 +203,8 @@ describe('illustrate', () => {
   it('adds a button to play replies and posts the image as a reply to the scene, once', async () => {
     const runner = runnerWith();
     const t = await playTurn(runner);
-    expect(delivery.sent[0]!.buttons?.[0]?.customId).toBe(`rpg:img:${t.id}:0`);
+    // Every scene has a map now (its battle map, or a sketch), then the picture button.
+    expect(delivery.sent[0]!.buttons?.map((b) => b.customId)).toEqual([`rpg:map:${t.id}:0`, `rpg:img:${t.id}:0`]);
     const r = runner.illustrate(t.id, campaign.id);
     expect(r.message).toMatch(/Painting/);
     expect(await r.done).toMatchObject({ path: expect.stringContaining(`turn-${t.id}.png`) });
@@ -215,7 +231,7 @@ describe('illustrate', () => {
   it('is off without a pipeline and refuses non-scene turns', async () => {
     const off = runnerWith(false);
     const t = await playTurn(off);
-    expect(delivery.sent[0]!.buttons).toBeUndefined();
+    expect(delivery.sent[0]!.buttons?.map((b) => b.customId)).toEqual([`rpg:map:${t.id}:0`]);
     expect(off.illustrate(t.id).message).toMatch(/turned off/);
     const on = runnerWith();
     expect(on.illustrate(99999).message).toMatch(/not a scene/);
@@ -316,18 +332,20 @@ describe('scene plans', () => {
     })();
     const ids = [t.actor_character_id!, created.$elf!, created.$rogue!, created.$inn!];
     db.prepare(`UPDATE records SET data_json = ? WHERE id = ?`).run(
-      JSON.stringify({
-        status: 'active', main: true, participants_ids: ids, round: 1, turn_of_id: created.$inn, initiative: ids.map((id, i) => ({ id, value: 10 - i })),
-        map: { cols: 10, rows: 8, cell_ft: 5, features: [{ kind: 'object', label: 'altar', x: 4, y: 0, w: 2, h: 1 }] },
-        positions: { [ids[0]!]: { x: 4, y: 7 }, [ids[3]!]: { x: 4, y: 1 }, [ids[1]!]: { x: 5, y: 2 }, [ids[2]!]: { x: 9, y: 6 } },
-      }),
+      JSON.stringify({ status: 'active', main: true, participants_ids: ids, round: 1, turn_of_id: created.$inn, initiative: ids.map((id, i) => ({ id, value: 10 - i })) }),
       created.$fight,
     );
+    // On the chapel's map (altar along the north wall); the hero already stands at 4,7.
+    setPos(ids[3]!, { x: 4, y: 1 });
+    setPos(ids[1]!, { x: 5, y: 2 });
+    setPos(ids[2]!, { x: 9, y: 6 });
     const plan = buildScenePlan(db, { ...t, scene_id: created.$fight! }, 'Painted', '', (id) => `/portraits/${id}.png`);
     expect(plan.focus).toEqual([t.actor_character_id, created.$inn, created.$elf]); // actor, whose turn, nearest to the action
     expect(plan.refs).toEqual([`/portraits/${t.actor_character_id}.png`, `/portraits/${created.$elf}.png`]);
     expect(plan.prompt).toContain('Image 1 shows the hero and image 2 shows the first companion');
-    expect(plan.prompt).toMatch(/Composition: the hero is .*in the foreground; the innkeeper is .*in the background by the altar, right next to the first companion/);
+    // Tokens come in record order now (everyone standing in the place), so check each part.
+    expect(plan.prompt).toMatch(/Composition: [^.]*the hero is [^;.]*in the foreground/);
+    expect(plan.prompt).toMatch(/Composition: [^.]*the innkeeper is [^;.]*in the background by the altar, right next to the first companion/);
     expect(plan.prompt).toContain('One more figure in the background');
     expect(plan.prompt).not.toMatch(/Thaniesh|Vargas|Marrow/);
   });
@@ -366,10 +384,10 @@ describe('3D miniatures', () => {
     expect(built).toEqual([expect.stringContaining(path.join('portraits', `${id}.png`))]); // portrait painted first
     expect(runner.buildMiniature(campaign.id, id).message).toBe('ready');
 
-    // A battle map turn: the diorama gets the miniature for that token.
+    // On the chapel's map: the diorama gets the miniature for that token.
     const room = (db.prepare(`SELECT id FROM records WHERE name = 'Cray Chapel'`).get() as { id: string }).id;
     db.transaction(() => {
-      const plan = planBatch(db, [op({ op: 'create', ref: '$s', kind: 'scene', name: 'Chapel', parent_id: room, data_json: JSON.stringify({ status: 'active', main: true, participants_ids: [id], map: { cols: 4, rows: 4, cell_ft: 5 }, positions: { [id]: { x: 1, y: 1 } } }) })] as never, { campaignId: campaign.id, actorUserId: 'o', constraints: [] });
+      const plan = planBatch(db, [op({ op: 'create', ref: '$s', kind: 'scene', name: 'Chapel', parent_id: room, data_json: JSON.stringify({ status: 'active', main: true, participants_ids: [id] }) })] as never, { campaignId: campaign.id, actorUserId: 'o', constraints: [] });
       writeBatch(db, campaign.id, plan);
     })();
     expect(await runner.dioramaNow(getCampaign(db, campaign.id)!, 'u1').done).toBeUndefined();
@@ -385,5 +403,32 @@ describe('3D miniatures', () => {
     await runner.confirm({ kind: 'chr', turnId: t.id, nonce: t.confirm_nonce!, userId: 'u2', campaign, target: target() });
     for (let i = 0; i < 20 && !built.length; i++) await new Promise((r) => setTimeout(r, 10));
     expect(built).toHaveLength(1);
+  });
+});
+
+describe('3D scene renders', () => {
+  it('🎨 renders the scene in 3D with the saved models (building missing ones first) and posts it under the reply', async () => {
+    const runner = runnerWith(true, 4, true);
+    const t = await playTurn(runner);
+    const r = runner.illustrate(t.id, campaign.id);
+    expect(await r.done).toMatchObject({ path: expect.stringContaining(`turn-${t.id}.png`) });
+    expect(built).toHaveLength(1); // the hero's miniature was built first
+    expect(scenes).toHaveLength(1);
+    expect(views).toEqual(['shot']);
+    expect(scenes[0]!.people.find((p) => p.id === t.actor_character_id)!.model).toContain('miniatures');
+    expect(scenes[0]!.indoor).toBe(true); // a chapel
+    const posted = delivery.sent.at(-1)!;
+    expect(posted.content).toMatch(/^🎬 \*\*Borin\*\*/);
+    expect(posted.replyTo).toBe('m1');
+    expect(JSON.parse(getTurn(db, t.id)!.delivery_json).image).toMatchObject({ status: 'done', mode: 'render3d' });
+  });
+
+  it('falls back to a painted picture when Blender fails', async () => {
+    const runner = runnerWith(true, 4, true);
+    const t = await playTurn(runner);
+    sceneFail = new Error('Blender crashed');
+    await runner.illustrate(t.id, campaign.id).done;
+    expect(delivery.sent.at(-1)!.content).toMatch(/^🎨/);
+    expect(prompts.some((p) => p.includes('Rain hammers'))).toBe(true);
   });
 });

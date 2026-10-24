@@ -4,8 +4,9 @@
 import { z } from 'zod';
 import { characterNameClash, playerCharacterOwners, getCampaign, getRecord, getTurn, nowIso, parseConfig, type Db } from './database.js';
 import { formatClock, syncWindow, worldClock } from './storylines.js';
+import { CREATURE_KINDS, dbView, placedIn, placeIdOf, posOf, readMap } from './maps.js';
 import { rollForTurn, type RollRecord } from './dice.js';
-import { planBatch, writeBatch, type RawOperation } from './records.js';
+import { planBatch, worldView, writeBatch, type RawOperation } from './records.js';
 import type { ToolSpec } from './providers.js';
 import type { CampaignRow, RecordRow, ToolContext, TurnRow } from './types.js';
 import { LIMITS, ValidationError } from './validation.js';
@@ -90,7 +91,7 @@ export const TOOL_SPECS: Record<'read_records' | 'search_reference' | 'roll_dice
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['check_id', 'purpose', 'expression', 'modifier', 'target', 'comparison', 'related_ids', 'visibility'],
+      required: ['check_id', 'purpose', 'expression', 'modifier', 'target', 'comparison', 'related_ids', 'visibility', 'attacker_id', 'target_id', 'reach_ft'],
       properties: {
         check_id: { type: 'string', description: 'Stable ID for this check within the turn, e.g. "mira_attack_1"' },
         purpose: { type: 'string', description: 'Short description, e.g. "Mira attacks the gate guard"' },
@@ -100,6 +101,9 @@ export const TOOL_SPECS: Record<'read_records' | 'search_reference' | 'roll_dice
         comparison: { type: ['string', 'null'], enum: ['>=', '>', '<=', '<', '==', null] },
         related_ids: { type: 'array', items: { type: 'string' }, description: 'Record/source IDs involved' },
         visibility: { type: 'string', enum: ['public', 'gm'], description: 'gm for secret checks players should not see' },
+        attacker_id: nullable('string', { description: 'For an attack: who attacks (record ID). Null for other checks.' }),
+        target_id: nullable('string', { description: 'For an attack: who or what is attacked (record ID). Null for other checks.' }),
+        reach_ft: nullable('number', { description: 'For an attack: its reach or range in feet (5 for most melee, 10 for reach weapons, the weapon range for ranged). The server checks it against the battle map after any movement in this turn.' }),
       },
     },
   },
@@ -159,6 +163,9 @@ const RollArgs = z.object({
   comparison: z.enum(['>=', '>', '<=', '<', '==']).nullable(),
   related_ids: z.array(z.string().max(80)).max(10),
   visibility: z.enum(['public', 'gm']),
+  attacker_id: z.string().max(80).nullable().optional(),
+  target_id: z.string().max(80).nullable().optional(),
+  reach_ft: z.number().min(0).max(5000).nullable().optional(),
 });
 
 const OpArgs = z.object({
@@ -280,6 +287,7 @@ export function runTool(env: ToolEnv, name: string, rawArgs: string): ToolOutcom
       case 'roll_dice': {
         if (!env.ctx.allowDice) throw new ValidationError('roll_dice is not available in this mode');
         const a = parseArgs(RollArgs, rawArgs);
+        requireAttackInfo(env, a);
         const r = rollForTurn(env.db, env.ctx.turnId, a);
         return { output: JSON.stringify(rollOutput(r)) };
       }
@@ -386,8 +394,9 @@ export function readEvents(env: ToolEnv, recordId: string | null, query: string 
   const { db, ctx } = env;
   // Character-creation replies were private to one player; only the GM view sees them in history.
   const modes = ctx.view === 'gm' ? "'play', 'correction', 'undo', 'character'" : "'play', 'correction', 'undo'";
-  const where = [`campaign_id = @campaign`, `status IN ('committed', 'delivered')`, `mode IN (${modes})`];
-  const params: Record<string, unknown> = { campaign: ctx.campaignId };
+  // Whispered turns are history only for the player who made them.
+  const where = [`campaign_id = @campaign`, `status IN ('committed', 'delivered')`, `mode IN (${modes})`, `(json_extract(delivery_json, '$.whisper') IS NULL OR actor_user_id = @viewer)`];
+  const params: Record<string, unknown> = { campaign: ctx.campaignId, viewer: ctx.actorUserId };
   if (recordId) {
     where.push(`changes_json LIKE @rid ESCAPE '\\'`);
     params.rid = `%"${escapeLike(recordId)}"%`;
@@ -558,7 +567,9 @@ export function commitTurn(
       }
       checkClockWindow(db, campaign, plan, ctx.actorCharacterId ?? null);
       checkTurnHandback(db, campaign.id, plan, ctx.actorCharacterId ?? null, (JSON.parse(turn.rolls_json) as unknown[]).length > 0);
-      checkFightMap(db, campaign.id, plan, ctx.actorCharacterId ?? null);
+      checkPlaces(db, campaign.id, plan, ctx.actorCharacterId ?? null);
+      const usedRolls = new Set(a.roll_ids);
+      checkAttackReach(db, campaign.id, plan, (JSON.parse(turn.rolls_json) as RollRecord[]).filter((r) => usedRolls.has(r.check_id)), ctx.actorCharacterId ?? null);
     }
     const applied = writeBatch(db, ctx.campaignId, plan);
     const revision = campaign.revision + 1;
@@ -619,28 +630,123 @@ function checkClockWindow(db: Db, campaign: CampaignRow, plan: ReturnType<typeof
  * acting character's own scene: the GM must resolve those NPC turns in the same reply and hand the
  * turn to a player character (or clear turn_of_id when the fight is over).
  */
+const ATTACK_WORDS = /\b(attacks?|attacking|strikes?|slash(es)?|stabs?|punch(es)?|kicks?|swings?|shoots?|shot|fires?|hits?|lunges?|bites?|claws?|smash(es)?|cleaves?|thrusts?)\b/i;
+
+/** Where the place has a map, an attack roll must say who attacks whom and with what reach. */
+function requireAttackInfo(env: ToolEnv, a: z.infer<typeof RollArgs>): void {
+  if (env.ctx.mode !== 'play' || !ATTACK_WORDS.test(a.purpose) || (a.target_id && a.reach_ft !== null && a.reach_ft !== undefined)) return;
+  if (!env.ctx.actorCharacterId) return;
+  const view = dbView(env.db, env.ctx.campaignId);
+  const place = placeIdOf(view, env.ctx.actorCharacterId);
+  if (!place || !readMap(view.get(place)?.data.map)) return;
+  throw new ValidationError(
+    'This looks like an attack, and this place has a map: declare attacker_id, target_id and reach_ft (5 for most melee, 10 for reach weapons, the range for ranged) so the server can check the distance. Declare it again with those fields.',
+  );
+}
+
 /**
- * A fight in the acting character's storyline needs a battle map, with every visible combatant
- * placed, so maps and illustrations show where everyone actually is.
+ * Attacks must reach: after this turn's movement, the attacker must be within the declared reach
+ * of the target on their place's map (Chebyshev distance between footprints, edge to edge).
  */
-function checkFightMap(db: Db, campaignId: string, plan: ReturnType<typeof planBatch>, actorCharacterId: string | null): void {
-  if (!actorCharacterId) return;
-  const rows = db.prepare(`SELECT * FROM records WHERE campaign_id = ? AND kind = 'scene' AND archived_at IS NULL`).all(campaignId) as RecordRow[];
-  const scenes = new Map(rows.map((r) => [r.id, { name: r.name, data: JSON.parse(r.data_json) as Record<string, unknown>, gm: JSON.parse(r.gm_notes_json || '{}') as Record<string, unknown> }]));
-  for (const [id, st] of plan.after) if (st.kind === 'scene') scenes.set(id, { name: st.name, data: st.archived_at ? { status: 'ended' } : st.data, gm: st.gm_notes });
-  for (const [, s] of scenes) {
-    const d = s.data;
-    if ((d.status !== undefined && d.status !== 'active') || !Array.isArray(d.participants_ids) || !d.participants_ids.includes(actorCharacterId)) continue;
-    const order = Array.isArray(d.initiative) ? (d.initiative as unknown[]).map((e) => (typeof e === 'string' ? e : (e as { id?: unknown } | null)?.id)).filter((x): x is string => typeof x === 'string') : [];
-    if (order.length < 2) continue;
-    if (!d.map || typeof d.map !== 'object') {
+function checkAttackReach(db: Db, campaignId: string, plan: ReturnType<typeof planBatch>, rolls: RollRecord[], actorCharacterId: string | null): void {
+  const attacks = rolls.filter((r) => r.target_id && typeof r.reach_ft === 'number');
+  if (!attacks.length) return;
+  const view = worldView(db, campaignId, plan.after);
+  for (const r of attacks) {
+    const attacker = r.attacker_id ?? actorCharacterId;
+    if (!attacker) continue;
+    const place = placeIdOf(view, attacker);
+    if (!place || place !== placeIdOf(view, r.target_id!)) continue;
+    const map = readMap(view.get(place)?.data.map);
+    const a = view.get(attacker);
+    const t = view.get(r.target_id!);
+    const ap = a ? posOf(a) : null;
+    const tp = t ? posOf(t) : null;
+    if (!map || !ap || !tp) continue;
+    const gap = (p: number, ps: number, q: number, qs: number) => Math.max(0, q - (p + ps - 1), p - (q + qs - 1));
+    const cells = Math.max(gap(ap.x, ap.size ?? 1, tp.x, tp.size ?? 1), gap(ap.y, ap.size ?? 1, tp.y, tp.size ?? 1));
+    const feet = cells * map.cell_ft;
+    // Adjacent squares (including diagonal) are 5 ft apart on a 5 ft grid.
+    if (feet > r.reach_ft! + 0.01) {
       throw new ValidationError(
-        `${s.name} has a fight (initiative) but no battle map. In this same save, set data.map {cols, rows, cell_ft: 5, features: [walls, doors, furniture, cover]} for the place, and data.positions {<id>: {x, y}} for every visible combatant (hidden ones in gm_notes.positions), consistent with the narration so far.`,
+        `${a!.name} is ${feet} ft from ${t!.name} on the map, but the attack "${r.check_id}" reaches ${r.reach_ft} ft. If they move first, set data.pos on ${attacker} to a cell within reach in this same save (respecting their movement); otherwise narrate that they close the distance instead of hitting, or use an attack that reaches.`,
       );
     }
-    const placed = new Set([...Object.keys((d.positions as object | undefined) ?? {}), ...Object.keys((s.gm.positions as object | undefined) ?? {})]);
-    const missing = order.filter((id) => !placed.has(id));
-    if (missing.length) throw new ValidationError(`${s.name}: every combatant needs a position on the battle map; place ${missing.join(', ')} in data.positions (or gm_notes.positions if hidden) in this save.`);
+  }
+}
+
+/**
+ * The world is mapped where it matters. The acting character's place must have a saved map, with
+ * a position for the actor and everyone in their scene or fight there. Anyone this save moves or
+ * changes needs a position too, on a mapped place. Bystanders nobody touched may stay unplaced
+ * until they come into the story (the GM sees them as "not placed yet"), so editing a place, say
+ * adding an exit, never drags in everyone standing in it.
+ */
+function checkPlaces(db: Db, campaignId: string, plan: ReturnType<typeof planBatch>, actorCharacterId: string | null): void {
+  if (!actorCharacterId) return;
+  const view = worldView(db, campaignId, plan.after);
+  const before = dbView(db, campaignId);
+  const actor = view.get(actorCharacterId);
+  const mine = placeIdOf(view, actorCharacterId);
+  if (!mine && actor && !actor.archived) {
+    throw new ValidationError(`${actor.name} is not in any location. Set their parent_id to the location they are in (create it with data.map if it is new) and give them data.pos on its map, in this save.`);
+  }
+  // Who must stand somewhere, by place.
+  const need = new Map<string, Set<string>>();
+  const want = (placeId: string | null, id: string) => {
+    if (!placeId) return;
+    if (!need.has(placeId)) need.set(placeId, new Set());
+    need.get(placeId)!.add(id);
+  };
+  want(mine, actorCharacterId);
+  // The actor's scene: its participants and combatants in the actor's place.
+  const sceneRows = db.prepare(`SELECT id FROM records WHERE campaign_id = ? AND kind = 'scene' AND archived_at IS NULL`).all(campaignId) as { id: string }[];
+  const sceneIds = new Set([...sceneRows.map((r) => r.id), ...[...plan.after.values()].filter((st) => st.kind === 'scene').map((st) => st.id)]);
+  for (const sid of sceneIds) {
+    const sc = view.get(sid);
+    if (!sc || sc.archived || (sc.data.status !== undefined && sc.data.status !== 'active')) continue;
+    const ids = [
+      ...(Array.isArray(sc.data.participants_ids) ? (sc.data.participants_ids as unknown[]) : []),
+      ...(Array.isArray(sc.data.initiative) ? (sc.data.initiative as unknown[]).map((e) => (typeof e === 'string' ? e : (e as { id?: unknown } | null)?.id)) : []),
+    ].filter((x): x is string => typeof x === 'string');
+    if (!ids.includes(actorCharacterId)) continue;
+    for (const id of ids) if (CREATURE_KINDS.has(view.get(id)?.kind ?? '') && placeIdOf(view, id) === mine) want(mine, id);
+  }
+  // Anyone this save creates, moves or changes.
+  for (const [id, st] of plan.after) if (CREATURE_KINDS.has(st.kind) && !st.archived_at) want(placeIdOf(view, id), id);
+
+  // A place created in this save that someone walked into from a mapped place links back to it.
+  for (const [id, st] of plan.after) {
+    if (st.kind !== 'character' || plan.before.get(id) === undefined) continue;
+    const to = placeIdOf(view, id);
+    const from = placeIdOf(before, id);
+    if (!to || !from || to === from || plan.before.get(to) !== null) continue;
+    const dest = view.get(to)!;
+    const origin = before.get(from);
+    const destMap = readMap(dest.data.map);
+    if (!destMap || !readMap(origin?.data.map)) continue;
+    const links = [...destMap.features, ...((Array.isArray(dest.gm_notes.map_features) ? dest.gm_notes.map_features : []) as { to?: unknown }[])].some((f) => f.to === from);
+    if (!links) {
+      throw new ValidationError(
+        `${dest.name} is new and ${st.name} came from ${origin!.name} (${from}): give ${dest.name}'s map the exit they came through, with "to": "${from}" (a door, stairs or an exit at its edge), so the two places stay connected.`,
+      );
+    }
+  }
+  for (const [placeId, ids] of need) {
+    const place = view.get(placeId)!;
+    if (!readMap(place.data.map)) {
+      // Townsfolk recorded in a town that nobody is playing in may stay as they are.
+      if (placeId !== mine && ![...ids].some((id) => plan.before.get(id) === null || placeIdOf(before, id) !== placeId || posOf(view.get(id)!))) continue;
+      throw new ValidationError(
+        `${place.name} (${placeId}) has no map, and ${[...ids].map((id) => view.get(id)?.name ?? id).join(', ')} ${ids.size > 1 ? 'are' : 'is'} there. In this same save either set its data.map {cols, rows, cell_ft: 5, features: [walls, doors, furniture, exits with "to"]} from its description and data.pos on them, or, if it is a whole town or region, create the specific place inside it (kind "location", parent_id ${placeId}, with data.map) and move them there (parent_id and data.pos).`,
+      );
+    }
+    const missing = [...ids].map((id) => view.get(id)!).filter((r) => r && !posOf(r));
+    if (missing.length) {
+      throw new ValidationError(
+        `${missing.map((r) => `${r.name} (${r.id})`).join(', ')} need${missing.length > 1 ? '' : 's'} a position on the map of ${place.name}: set data.pos {x, y} (gm_notes.pos if their whereabouts are secret) in this save, consistent with the narration. Someone who is not really here belongs in another location (parent_id).`,
+      );
+    }
   }
 }
 

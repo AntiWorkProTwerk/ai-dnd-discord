@@ -25,7 +25,7 @@ export interface PortraitInfo {
   error?: string;
   updated_at?: string;
   /** 3D miniature built from this portrait by the local 3D pipeline, for dioramas. */
-  miniature?: { status: 'queued' | 'done' | 'failed'; path?: string; portrait_hash?: string; seconds?: number; error?: string };
+  miniature?: { status: 'queued' | 'done' | 'failed'; path?: string; portrait_hash?: string; seconds?: number; error?: string; quality?: number };
 }
 
 export function portraitPathFor(dataDir: string, campaignId: string, recordId: string): string {
@@ -78,6 +78,9 @@ export function buildPortraitPrompt(db: Db, record: RecordRow, style: string): s
     .concat('.');
 }
 
+/** Bumped when miniatures get built better: older ones are rebuilt the next time they are needed. */
+export const MINIATURE_QUALITY = 2;
+
 export function miniaturePathFor(dataDir: string, campaignId: string, recordId: string): string {
   return path.join(dataDir, 'images', campaignId, 'miniatures', `${recordId}.glb`);
 }
@@ -86,7 +89,7 @@ export function miniaturePathFor(dataDir: string, campaignId: string, recordId: 
 export function currentMiniature(db: Db, campaignId: string, recordId: string, style: string): string | null {
   const p = currentPortrait(db, campaignId, recordId, style);
   const m = p?.miniature;
-  return p && m?.status === 'done' && m.path && m.portrait_hash === p.prompt_hash && fs.existsSync(m.path) ? m.path : null;
+  return p && m?.status === 'done' && m.path && m.portrait_hash === p.prompt_hash && (m.quality ?? 1) >= MINIATURE_QUALITY && fs.existsSync(m.path) ? m.path : null;
 }
 
 export function portraitHash(prompt: string): string {
