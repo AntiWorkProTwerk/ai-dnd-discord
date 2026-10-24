@@ -24,6 +24,7 @@ import { effectiveBudget } from './agent.js';
 import { getCampaign, getCampaignByChannel, getMember, getRecord, getTurn, memberCharacterIds, parseConfig, type Db } from './database.js';
 import { campaignIdForThread, privateThreadOwner } from './storylines.js';
 import { log } from './log.js';
+import { lookAround } from './look.js';
 import { renderSheet, renderUsage, sanitize } from './render.js';
 import { DeliveryError, interactionUsable, type DeliveryPort, type DeliveryTarget, type OutboundMessage, type TurnRunner } from './turns.js';
 import type { CampaignRow, SourceRole } from './types.js';
@@ -87,6 +88,12 @@ export function buildCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody
       s
         .setName('sheet')
         .setDescription('Show your character sheet and inventory')
+        .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true)),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('look')
+        .setDescription('See where you are: ways out, what is around you, who is here, what is known about the area')
         .addStringOption((o) => o.setName('as').setDescription('Which of your characters (if you control several)').setRequired(false).setAutocomplete(true)),
     )
     .addSubcommand((s) =>
@@ -219,7 +226,7 @@ export interface DiscordDeps {
 
 const OWNER_ONLY = new Set(['import', 'configure', 'start', 'pause', 'resume', 'gm', 'undo', 'usage', 'backup']);
 const MODEL_MODES = { play: 'play', ask: 'ask', recap: 'recap', character: 'character', gm: 'gm', configure: 'configure' } as const;
-const EPHEMERAL = new Set(['ask', 'character', 'gm', 'configure', 'import', 'usage', 'backup', 'sheet', 'undo', 'setup', 'start', 'pause', 'resume']);
+const EPHEMERAL = new Set(['ask', 'character', 'gm', 'configure', 'import', 'usage', 'backup', 'sheet', 'look', 'undo', 'setup', 'start', 'pause', 'resume']);
 
 function targetOf(i: ChatInputCommandInteraction | ButtonInteraction | ModalSubmitInteraction, ephemeral: boolean): DeliveryTarget {
   return {
@@ -339,6 +346,11 @@ export async function handleCommand(deps: DiscordDeps, i: ChatInputCommandIntera
       if (chosen.error) return reply(i, chosen.error);
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       return reply(i, await runner.mergeToMain(campaign, i.user.id, i.channelId, chosen.id));
+    }
+    case 'look': {
+      const chosen = pickCharacter(db, campaign, i);
+      if (chosen.error) return reply(i, chosen.error);
+      return reply(i, lookAround(db, campaign, i.user.id, chosen.id));
     }
     case 'sheet': {
       const chosen = pickCharacter(db, campaign, i);
@@ -497,6 +509,8 @@ export async function handleButton(deps: DiscordDeps, i: ButtonInteraction): Pro
       ? await deps.runner.requestSideThread(Number(m[2]), i.user.id, campaign.id)
       : m[1] === 'dio'
       ? deps.runner.diorama(Number(m[2]), campaign.id).message
+      : m[1] === 'look'
+      ? lookAround(deps.db, campaign, i.user.id)
       : await deps.runner.confirm({ kind: m[1]!, turnId: Number(m[2]), nonce: m[3]!, userId: i.user.id, campaign, target: targetOf(i, true) });
   log.info('button result', { kind: m[1], turn: Number(m[2]), user: i.user.id, result });
   await reply(i, result);

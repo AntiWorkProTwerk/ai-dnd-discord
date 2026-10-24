@@ -57,7 +57,7 @@ export function receipts(db: Db, turn: TurnRow): string[] {
   // header and the battle map, not as raw changes.
   // Bookkeeping is not news: scene state, positions on the map, and the maps of places.
   const diffs = (changes.diffs ?? []).filter(
-    (d) => !d.hidden && !(d.kind === 'scene' && SCENE_BOOKKEEPING.test(d.field.replace(/^data./, ''))) && !/^data\.pos(\.|$)/.test(d.field) && !(d.kind === 'location' && /^data\.(map|exits)(\.|$)/.test(d.field)),
+    (d) => !d.hidden && !(d.kind === 'scene' && SCENE_BOOKKEEPING.test(d.field.replace(/^data./, ''))) && !/^data\.pos(\.|$)/.test(d.field) && !(d.kind === 'location' && /^data\.(map|exits|notable)(\.|$)/.test(d.field)),
   );
   for (const d of diffs.slice(0, 10)) {
     if (d.field === 'created') lines.push(`➕ ${d.name} (${d.kind})`);

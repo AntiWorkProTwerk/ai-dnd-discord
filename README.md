@@ -210,6 +210,7 @@ Confirmation buttons expire after `CONFIRMATION_TTL_MINUTES` (corrections, undo)
 | `/rpg play` | Players with a character | **Public** | Yes | Main game action. `as:` picks which of your characters acts |
 | `/rpg ask` | Anyone in the channel | Private | Yes | Read-only question. No dice, no writes, player-visible data only |
 | `/rpg sheet` | Players | Private | No | Your sheet and inventory from the database, without GM notes. `as:` picks the character |
+| `/rpg look` | Players | Private | No | Where your character is: ways out (named once the party has been there), what is around you and who is in view, with distances, and what is publicly known about the area. Also the **👀 Look around** button under every reply. `as:` picks the character |
 | `/rpg map` | Players | Public map, private acknowledgement | No | Map of the place your character is in (`as:` picks the character) |
 | `/rpg merge` | Players in that storyline, owner | Public announcement, private acknowledgement | No | Run in a side thread: the thread closes and that storyline becomes the main story in the main channel |
 | `/rpg portrait` | Players | Private | No (local image) | Your character's reference portrait; `regenerate:true` paints a new one |
@@ -247,7 +248,7 @@ Players don't have to stay together. Each **storyline** is an ordinary active `s
 The whole game world is mapped and saved, so it stays consistent: distances are exact, "I walk over to the fireplace" moves you to real cells, and a place looks the same whenever anyone comes back.
 - **Every place is a location with its own grid map** (`data.map`: `{cols, rows, cell_ft, features: [{kind, label, x, y, w, h, to}]}`). Feature kinds are wall, door, cover, difficult, water, pit, object, stairs, light and exit. Doors, stairs and exits carry `to`: the place they lead to.
 - **Everyone has a saved position** (`data.pos {x, y, size}` on each character and npc) on the map of the place they are in. NPCs stay where they were left.
-- **New places are made on the spot.** The first time anyone goes somewhere unmapped (out the back door, down an alley), the GM must create that place and its map in the same move, linked back to where they came from. A whole town is never one map: the GM makes the specific street or room inside it.
+- **New places are made when someone goes there**, or ahead of time in the background (below). The first time anyone goes somewhere unmapped (out the back door, down an alley), the GM must create that place and its map in the same move, linked back to where they came from. A whole town is never one map: the GM makes the specific street or room inside it.
 - **Long trips** (another town, days away) use the shared world clock instead of the grid, and put you at the destination's entrance.
 
 The GM sees a text version of the current place's map (positions, distances, exits and where they lead, who still needs a spot) and the places nearby.
@@ -260,6 +261,23 @@ The server checks every save:
 - a new place someone walked into links back to where they came from.
 
 Hidden creatures (`gm_notes.pos`) and secret terrain (the location's `gm_notes.map_features`) are never drawn. Battle maps saved on scenes by older versions move to their place automatically at startup.
+
+### What exists: the GM decides, players add small things
+
+As at a real table, the GM owns the world and players explore it. When a player's words assume something ("I go to the nearest fur trader"), the GM answers from what is recorded:
+- **Settled:** it is there, or it is not, and the GM says what is there instead.
+- **Unsettled and small:** yes, often with a twist (a fur stall that is closed for the night). It is saved, so it stays true.
+- **Unsettled and big:** no, or earn it ("the Reeve is my uncle" gets you a look from the guards, not the key).
+
+Three layers keep this consistent:
+- **Town outlines.** Every town, village or district gets a short public list of what is there and what it lacks (`data.notable`: "ferry dock", "tanner (buys pelts)", "no smith"), with secrets in its GM notes. The GM sees it every turn; players see it with 👀 Look around.
+- **Unknown until seen.** The server records every place a player character has been in. A save that removes, moves or relabels something on a seen map, or shrinks it, is rejected unless the GM gives a reason in the world (`world_change`: "the fire burned the stable down"). Additions are fine, as are linking a door that led nowhere and claiming an **open** feature: maps leave room for later, such as a shuttered shopfront that can turn out to be the fur trader.
+- **Background preparation** (`WORLD_PREP=on`, default). After each action, the server looks around the actor's place for:
+  - a town with no outline;
+  - a door or exit leading to a place with no map;
+  - a named door or exit leading nowhere yet.
+
+  It then runs one small GM job in the background to prepare them: map, people, secrets, links both ways. Players are never kept waiting and nothing is posted. Prep cannot touch characters or scenes, roll dice or change what players have seen. It runs one job at a time per campaign, never repeats the same tasks, and is charged to the campaign budget.
 
 To see the map (a top-down tactical grid with tokens, name labels, a legend, wounded and down markers, and a gold ring for whose turn it is):
 - `/rpg play map:true text: …` posts the map right after the reply.

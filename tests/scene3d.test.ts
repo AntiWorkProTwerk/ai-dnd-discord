@@ -272,6 +272,23 @@ describe('facing', () => {
     expect(me.face).toEqual({ x: v.x, y: v.y });
   });
 
+  it('a saved facing turns the person that way out of a fight, and the shot looks where they look', () => {
+    mapPlace(ids.$inn!, MAP(), { [ids.$thaniesh!]: { x: 4, y: 4, facing: 'n' } });
+    const s = scene('Common room', ids.$inn!, { participants_ids: [ids.$thaniesh] });
+    const me = person(buildSceneSpec(db, turn(s)).people, ids.$thaniesh!);
+    expect(me.face).toEqual({ x: me.x, y: me.y - 1 });
+    expect(me.faced).toBe(true);
+  });
+
+  it('in a fight a saved facing gives way to squaring up to the nearest combatant', () => {
+    mapPlace(ids.$inn!, MAP(), { ...positions(), [ids.$thaniesh!]: { x: 1, y: 4, facing: 's' } });
+    const s = scene('Brawl', ids.$inn!, { participants_ids: all(), initiative: all().map((id, i) => ({ id, value: 20 - i })) });
+    const spec = buildSceneSpec(db, turn(s));
+    const me = person(spec.people, ids.$thaniesh!);
+    expect(me.faced).toBeUndefined();
+    expect(me.face).toEqual({ x: person(spec.people, ids.$vargas!).x, y: person(spec.people, ids.$vargas!).y });
+  });
+
   it('a one-entry initiative is not a fight', () => {
     mapPlace(ids.$inn!, MAP(), positions());
     const s = scene('Common room', ids.$inn!, { participants_ids: all(), initiative: [{ id: ids.$bram, value: 10 }] });
@@ -311,6 +328,34 @@ describe('materials and indoor/outdoor', () => {
     const s = scene('the street', ids.$market!, { participants_ids: [ids.$thaniesh] });
     const spec = buildSceneSpec(db, turn(s));
     expect(spec).toMatchObject({ indoor: false, floor: 'cobbles' });
+  });
+
+  it('the ground the description names beats the kind of place in the name: a muddy bank in "Market Mound Riverbank" is dirt', () => {
+    setData(ids.$market!, { description: 'A narrow plank landing and muddy bank beside the main channel below Market Mound.' });
+    db.prepare('UPDATE records SET name = ? WHERE id = ?').run('Market Mound Riverbank', ids.$market!);
+    mapPlace(ids.$market!, MAP([{ kind: 'water', label: 'main channel', x: 0, y: 0, w: 10, h: 3 }]), { [ids.$thaniesh!]: { x: 5, y: 6 } });
+    const s = scene('Down to the Main Channel', ids.$market!, { participants_ids: [ids.$thaniesh] });
+    const spec = buildSceneSpec(db, turn(s));
+    expect(spec).toMatchObject({ indoor: false, floor: 'dirt' });
+    // Still in town: the place says "Market Mound" and the pilings are posts, not blocks.
+    expect(spec.town).toBe(true);
+  });
+
+  it('exits are flat ways out, never blocks; named pilings are posts; the wild is not a town', () => {
+    setData(ids.$market!, { description: 'A clearing deep in the pinewood.' });
+    db.prepare('UPDATE records SET name = ? WHERE id = ?').run('Pine Clearing', ids.$market!);
+    mapPlace(
+      ids.$market!,
+      MAP([
+        { kind: 'exit', label: 'plank path up to town', x: 5, y: 7, w: 1, h: 1 },
+        { kind: 'exit', label: 'steps down to the water', x: 0, y: 4, w: 1, h: 1 },
+        { kind: 'object', label: 'landing pilings', x: 0, y: 2, w: 1, h: 2 },
+      ]),
+      { [ids.$thaniesh!]: { x: 5, y: 5 } },
+    );
+    const spec = buildSceneSpec(db, turn(scene('In the clearing', ids.$market!, { participants_ids: [ids.$thaniesh] })));
+    expect(spec.features.map((f) => f.shape)).toEqual(['path', 'stairs', 'pillar']);
+    expect(spec.town).toBe(false);
   });
 
   it('a scene named "Rain Beyond the Inn" at the inn is outdoors', () => {

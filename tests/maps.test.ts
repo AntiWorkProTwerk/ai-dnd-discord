@@ -427,7 +427,7 @@ describe('map snapshot and rendering', () => {
   it('gives the GM a text map with hidden things marked and distances from the actor', () => {
     const text = asciiMap(db, campaign.id, ids.$inn!, ids.$vargas!)!;
     expect(text).toContain('10x8 grid, 5 ft per cell');
-    expect(text).toMatch(/MG = Marrow Gale \(.+\) at 5,4, 10 ft from the actor/);
+    expect(text).toMatch(/MG = Marrow Gale \(.+\) at 5,4, south-east of the actor \(se\), 10 ft/);
     expect(text).toMatch(/HS = Hidden Spy \(.+\) at 9,7 \[hidden from players\]/);
     expect(text).toContain('pit "trapdoor" at 8,1 1x1 [hidden: gm_notes]');
     expect(asciiMap(db, campaign.id, ids.$brawl!, null)).toBeNull(); // a scene is not a place
@@ -446,7 +446,7 @@ describe('map snapshot and rendering', () => {
     expect(text).toContain(`exit "street door" at 9,4 1x1 -> leads to Market Lane (${made.$street})`);
     expect(text).toContain(`stairs at 9,6 1x1 -> leads to Cellar (${made.$cellar})`);
     expect(text).toContain(`Not placed yet (give them data.pos when they come into the story): Latecomer (${made.$late})`);
-    expect(text).toContain(`item Iron key (${made.$key}) at 6,3, 15 ft from the actor`);
+    expect(text).toContain(`item Iron key (${made.$key}) at 6,3, east of the actor (e), 15 ft`);
     expect(text).toMatch(/Lu = Lurker \(.+\) at 8,5 \[hidden from players\]/);
     const rows = text.split('\n');
     expect(rows[1 + 3]!.slice(12, 14)).toBe(' i'); // the key on its cell (row 3, column 6)
@@ -466,7 +466,7 @@ describe('posting maps', () => {
     const r = runner.submit({ campaign, userId: 'u-v', mode: 'play', requestId: 'p1', text: 'step closer', target: { channelId: 'main-chan', ephemeral: false }, map: true });
     await runner.idle();
     const t = getTurn(db, r.turnId!)!;
-    expect(delivery.sent[0]!.message.buttons?.map((b) => b.customId)).toEqual([`rpg:map:${t.id}:0`]);
+    expect(delivery.sent[0]!.message.buttons?.map((b) => b.customId)).toEqual([`rpg:map:${t.id}:0`, `rpg:look:${t.id}:0`]);
     expect(delivery.sent[0]!.message.content).not.toMatch(/data\.pos|positions|participants_ids/); // bookkeeping is not shown as changes
     const posted = delivery.sent.find((m) => m.message.file?.name === `map-${t.id}.png`)!;
     expect(posted.message.replyTo).toBe('m1');
@@ -597,7 +597,7 @@ describe('one 3D scene, three cameras', () => {
     await dioRunner.idle();
     await new Promise((res) => setTimeout(res, 20));
     const t = getTurn(db, r.turnId!)!;
-    expect(delivery.sent[0]!.message.buttons?.map((b) => b.label)).toEqual(['🗺️ Map', '🧊 Diorama']);
+    expect(delivery.sent[0]!.message.buttons?.map((b) => b.label)).toEqual(['🗺️ Map', '👀 Look around', '🧊 Diorama']);
     expect(calls.map((c) => [c.view, c.turntable, c.spec.people.length])).toEqual([['diorama', undefined, 3]]);
     const posted = delivery.sent.find((m) => m.message.file?.name === `diorama-${t.id}.png`)!;
     expect(posted.message.replyTo).toBe('m1');

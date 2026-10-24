@@ -75,6 +75,7 @@ const runner = new TurnRunner({
   modelLimiter: new Semaphore(1),
   images: imageConfig.enabled ? { generator: createWorkshopGenerator(imageConfig), queue: gpuQueue, config: imageConfig } : undefined,
   diorama: dioramaConfig.enabled ? { queue: gpuQueue, miniatures: createMiniatureBuilder(dioramaConfig), scene: createSceneRenderer(dioramaConfig) } : undefined,
+  worldPrep: config.worldPrep,
 });
 
 let campaign = getCampaignByChannel(db, GUILD, CHANNEL);

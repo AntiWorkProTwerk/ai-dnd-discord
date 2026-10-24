@@ -52,6 +52,7 @@ import { buildPortraitPrompt, currentMiniature, currentPortrait, MINIATURE_QUALI
 import { dioramaPathFor, type MiniatureBuilder, type SceneRenderer } from './diorama.js';
 import { buildSceneSpec, layoutFor, momentNow, type SceneMoment } from './scene3d.js';
 import { composeMapPng, mapPathFor, mapSnapshot, writeMapPng, type MapSnapshot } from './maps.js';
+import { prepJobFor } from './prep.js';
 import { activeScenes, isActiveScene, isMain, mainScene, participants, privateThreadFor, savePrivateThread, sceneData, saveThread, storylineKey, storylineOf, threadFor, worldClock } from './storylines.js';
 import { buildScenePlan, buildScenePrompt, ImageBusyError, imagePathFor, logImageError, type ImageConfig, type ImageGenerator, type ImageQueue } from './images.js';
 import { renderDiffs, renderPlay, sanitize, splitMessage } from './render.js';
@@ -117,7 +118,7 @@ export function interactionUsable(target: DeliveryTarget): boolean {
 export interface SubmitInput {
   campaign: CampaignRow;
   userId: string;
-  mode: Extract<TurnMode, 'play' | 'ask' | 'recap' | 'character' | 'gm' | 'configure' | 'summary'>;
+  mode: Extract<TurnMode, 'play' | 'ask' | 'recap' | 'character' | 'gm' | 'configure' | 'summary' | 'prep'>;
   requestId: string;
   text: string;
   target: DeliveryTarget;
@@ -154,6 +155,8 @@ export interface RunnerDeps {
    * base. Shares the GPU queue with paintings.
    */
   diorama?: { queue: ImageQueue; miniatures?: MiniatureBuilder; scene: SceneRenderer };
+  /** Prepare the places around the party in the background (outlines, maps, exits). */
+  worldPrep?: boolean;
 }
 
 const READ_ONLY: TurnMode[] = ['ask', 'recap', 'summary'];
@@ -212,7 +215,7 @@ export class TurnRunner {
       if (!memberCharacterIds(member).includes(input.characterId)) return { status: 'rejected', message: 'You do not control that character.' };
       db.prepare('UPDATE members SET character_record_id = ? WHERE campaign_id = ? AND discord_user_id = ?').run(input.characterId, input.campaign.id, input.userId);
     }
-    const actingCharacter = input.mode === 'gm' || input.mode === 'configure' || input.mode === 'character' ? null : (input.characterId ?? member?.character_record_id ?? null);
+    const actingCharacter = input.mode === 'gm' || input.mode === 'configure' || input.mode === 'character' || input.mode === 'prep' ? null : (input.characterId ?? member?.character_record_id ?? null);
     // Play turns belong to the actor's storyline; its replies go to that storyline's channel.
     const scene = input.mode === 'play' ? storylineOf(db, input.campaign.id, actingCharacter) : undefined;
     // A whispered action is answered in the player's private thread (routed once it is resolved).
@@ -290,6 +293,8 @@ export class TurnRunner {
         return { ...base, view: 'gm', saveMode: 'none', allowDice: false, includePendingSources: true };
       case 'summary':
         return { ...base, view: 'gm', saveMode: 'none', allowDice: false };
+      case 'prep':
+        return { ...base, view: 'gm', saveMode: 'commit', allowDice: false };
       default:
         return { ...base, view: 'player', saveMode: 'none', allowDice: false };
     }
@@ -310,7 +315,7 @@ export class TurnRunner {
     // Keep the character chosen at submit; otherwise use the active one (it may have been created after queuing).
     const member = getMember(db, campaign.id, turn.actor_user_id);
     const characterId =
-      turn.mode === 'gm' || turn.mode === 'configure' || turn.mode === 'character' ? null : (turn.actor_character_id ?? member?.character_record_id ?? null);
+      turn.mode === 'gm' || turn.mode === 'configure' || turn.mode === 'character' || turn.mode === 'prep' ? null : (turn.actor_character_id ?? member?.character_record_id ?? null);
     updateTurn(db, turn.id, {
       status: 'running',
       attempts: turn.attempts + 1,
@@ -362,6 +367,13 @@ export class TurnRunner {
 
   private async handleResult(turn: TurnRow, result: AgentResult): Promise<void> {
     const { db, config } = this.deps;
+    if (turn.mode === 'prep') {
+      // Background work: nobody is waiting for it, so nothing is posted either way.
+      const ok = result.kind === 'saved';
+      updateTurn(db, turn.id, ok ? { status: 'delivered' } : { status: 'aborted', error: (result.kind === 'failed' ? result.reason : 'no save').slice(0, 1000) });
+      log.info('world prep', { turn: turn.id, campaign: turn.campaign_id, ok, ...(ok ? { note: getTurn(db, turn.id)?.public_reply } : { error: getTurn(db, turn.id)?.error }) });
+      return;
+    }
     if (result.kind === 'failed') {
       const rolls = JSON.parse(turn.rolls_json) as RollRecord[];
       // Resume once with the same turn and its saved dice; never a fresh attempt with new dice.
@@ -398,6 +410,7 @@ export class TurnRunner {
         }
         if (wants.auto_diorama) this.diorama(turn.id);
         this.maybeSummarize(turn.campaign_id);
+        this.maybePrep(getTurn(db, turn.id)!);
         if ((JSON.parse(getTurn(db, turn.id)!.delivery_json) as { auto_image?: boolean }).auto_image) this.illustrate(turn.id);
         return;
       }
@@ -537,6 +550,29 @@ export class TurnRunner {
       text: String(upTo),
       target: { channelId: campaign.channel_id, ephemeral: true },
     });
+  }
+
+  /**
+   * Gets the places around the party ready in the background (see prep.ts): one run at a time per
+   * campaign, never the same set of tasks twice.
+   */
+  private maybePrep(turn: TurnRow): void {
+    const { db } = this.deps;
+    if (!this.deps.worldPrep || !turn.actor_character_id) return;
+    if (db.prepare(`SELECT 1 FROM turns WHERE campaign_id = ? AND mode = 'prep' AND status IN ('queued', 'running')`).get(turn.campaign_id)) return;
+    const job = prepJobFor(db, turn.campaign_id, turn.actor_character_id);
+    const campaign = getCampaign(db, turn.campaign_id);
+    if (!job || !campaign || campaign.status !== 'active') return;
+    const key = crypto.createHash('sha256').update(job.tasks.map((t) => t.key).sort().join('|')).digest('hex').slice(0, 20);
+    const r = this.submit({
+      campaign,
+      userId: campaign.owner_user_id,
+      mode: 'prep',
+      requestId: `prep:${key}`,
+      text: JSON.stringify(job),
+      target: { channelId: campaign.channel_id, ephemeral: true },
+    });
+    if (r.status === 'queued') log.info('world prep queued', { turn: r.turnId, campaign: campaign.id, tasks: job.tasks.map((t) => t.key) });
   }
 
   // ------------------------------------------------------------ cached recap
@@ -1362,6 +1398,8 @@ export class TurnRunner {
       const out: OutboundMessage[] = renderPlay(this.deps.db, turn).map((content) => ({ content }));
       const buttons: Button[] = [];
       if ((JSON.parse(turn.delivery_json) as { map_snapshot?: unknown }).map_snapshot) buttons.push({ customId: `rpg:map:${turn.id}:0`, label: '🗺️ Map', style: 'secondary' });
+      // Anyone can check where their own character is and what they can see (no model call).
+      buttons.push({ customId: `rpg:look:${turn.id}:0`, label: '👀 Look around', style: 'secondary' });
       if (this.deps.images) buttons.push({ customId: `rpg:img:${turn.id}:0`, label: '🎨 Illustrate', style: 'secondary' });
       if (this.deps.diorama && buttons.some((b) => b.customId.startsWith('rpg:map:'))) buttons.push({ customId: `rpg:dio:${turn.id}:0`, label: '🧊 Diorama', style: 'secondary' });
       // A side storyline still posting in the main channel can be moved into its own thread.
@@ -1532,6 +1570,7 @@ export class TurnRunner {
 function queueKey(turn: TurnRow): string {
   if (turn.mode === 'play') return storylineKey(turn.campaign_id, turn.scene_id);
   if (turn.mode === 'gm' || turn.mode === 'configure' || turn.mode === 'summary') return `${turn.campaign_id}:owner`;
+  if (turn.mode === 'prep') return `${turn.campaign_id}:prep`;
   return `${turn.campaign_id}:user:${turn.actor_user_id}`;
 }
 

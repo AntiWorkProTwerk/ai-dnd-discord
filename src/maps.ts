@@ -20,6 +20,8 @@ export interface MapFeature {
   h: number;
   /** An exit (door, stairs, open edge): the id of the location it leads to. */
   to?: string;
+  /** Room left for the story: an unclaimed shopfront, house or alley that may later become what is needed (relabel it then). */
+  open?: boolean;
 }
 
 export interface SceneMap {
@@ -29,10 +31,45 @@ export interface SceneMap {
   features: MapFeature[];
 }
 
+/** The way a creature faces on the map: compass points, north is up (smaller y). */
+export const FACINGS = { n: [0, -1], ne: [1, -1], e: [1, 0], se: [1, 1], s: [0, 1], sw: [-1, 1], w: [-1, 0], nw: [-1, -1] } as const;
+export type Facing = keyof typeof FACINGS;
+const isFacing = (v: unknown): v is Facing => typeof v === 'string' && Object.hasOwn(FACINGS, v);
+
+export const FACING_NAMES: Record<Facing, string> = { n: 'north', ne: 'north-east', e: 'east', se: 'south-east', s: 'south', sw: 'south-west', w: 'west', nw: 'north-west' };
+export const OPPOSITE: Record<Facing, Facing> = { n: 's', ne: 'sw', e: 'w', se: 'nw', s: 'n', sw: 'ne', w: 'e', nw: 'se' };
+
+/** The compass point and distance (cells) from a cell to the nearest cell of a rectangle; null when standing on it. */
+export function compassTo(from: { x: number; y: number }, r: { x: number; y: number; w: number; h: number }): { facing: Facing; cells: number } | null {
+  const dx = Math.min(Math.max(from.x, r.x), r.x + r.w - 1) - from.x;
+  const dy = Math.min(Math.max(from.y, r.y), r.y + r.h - 1) - from.y;
+  if (!dx && !dy) return null;
+  // y runs down, so a positive angle points south.
+  const step = (Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) + 8) % 8;
+  return { facing: (['e', 'se', 's', 'sw', 'w', 'nw', 'n', 'ne'] as const)[step]!, cells: Math.max(Math.abs(dx), Math.abs(dy)) };
+}
+
+/** The way pictures show a creature facing: its saved facing, else toward the nearest other creature there, else south. */
+export function shownFacing(view: WorldView, placeId: string, id: string): Facing {
+  const me = view.get(id);
+  const p = me ? posOf(me) : null;
+  if (!p) return 's';
+  if (p.facing) return p.facing;
+  let best: { facing: Facing; cells: number } | null = null;
+  for (const r of placedIn(view, placeId)) {
+    const q = r.id !== id && CREATURE_KINDS.has(r.kind) ? posOf(r) : null;
+    const to = q && !q.hidden ? compassTo(p, { x: q.x, y: q.y, w: q.size ?? 1, h: q.size ?? 1 }) : null;
+    if (to && (!best || to.cells < best.cells)) best = to;
+  }
+  return best?.facing ?? 's';
+}
+
 export interface Position {
   x: number;
   y: number;
   size?: number;
+  /** Set when they turn, face or look at something; unset, pictures pick a natural direction. */
+  facing?: Facing;
 }
 
 const MAX_CELLS = 2400;
@@ -55,6 +92,7 @@ function featureProblems(where: string, raw: unknown, map: { cols: number; rows:
     if (!o) return void out.push(`${where}[${i}] must be an object {kind,label,x,y,w,h}`);
     if (!FEATURE_KINDS.includes(o.kind as FeatureKind)) out.push(`${where}[${i}].kind must be one of ${FEATURE_KINDS.join(', ')}`);
     if (o.label !== undefined && (typeof o.label !== 'string' || o.label.length > 60)) out.push(`${where}[${i}].label must be text of at most 60 characters`);
+    if (o.open !== undefined && typeof o.open !== 'boolean') out.push(`${where}[${i}].open must be true or false`);
     if (!isInt(o.x, 0, map.cols - 1) || !isInt(o.y, 0, map.rows - 1) || !isInt(o.w, 1, map.cols) || !isInt(o.h, 1, map.rows)) {
       out.push(`${where}[${i}] needs integer x,y,w,h inside the ${map.cols}x${map.rows} grid`);
     } else if ((o.x as number) + (o.w as number) > map.cols || (o.y as number) + (o.h as number) > map.rows) {
@@ -128,7 +166,7 @@ export function placeIdOf(view: Pick<WorldView, 'get'>, id: string): string | nu
 export function posOf(r: Pick<PlaceRecord, 'data' | 'gm_notes'>): (Position & { hidden: boolean }) | null {
   for (const [raw, hidden] of [[r.data.pos, false], [r.gm_notes.pos, true]] as const) {
     const p = obj(raw);
-    if (p && typeof p.x === 'number' && typeof p.y === 'number') return { x: p.x, y: p.y, size: typeof p.size === 'number' ? p.size : 1, hidden };
+    if (p && typeof p.x === 'number' && typeof p.y === 'number') return { x: p.x, y: p.y, size: typeof p.size === 'number' ? p.size : 1, ...(isFacing(p.facing) ? { facing: p.facing } : {}), hidden };
   }
   return null;
 }
@@ -260,6 +298,8 @@ export function placeProblems(view: WorldView, changed: PlaceRecord[], before: (
       }
       const creature = CREATURE_KINDS.has(r.kind);
       const size = pos.size ?? 1;
+      const facing = (obj(pos.hidden ? r.gm_notes.pos : r.data.pos) ?? {}).facing;
+      if (mine && facing !== undefined && !isFacing(facing)) out.push(`${at}: ${r.name} (${r.id}) pos.facing must be one of ${Object.keys(FACINGS).join(', ')} (north is up)`);
       if (!isInt(pos.x, 0, map.cols - 1) || !isInt(pos.y, 0, map.rows - 1) || !isInt(size, 1, 4) || pos.x + size > map.cols || pos.y + size > map.rows) {
         if (mine) out.push(`${at}: ${r.name} (${r.id}) needs whole-cell x 0-${map.cols - 1}, y 0-${map.rows - 1} (and size 1-4) inside the ${map.cols}x${map.rows} map`);
         continue;
@@ -313,6 +353,7 @@ export interface MapToken {
   isTurn: boolean;
   /** Joined the fight mid-round: acts at the end of the round (drawn faded). */
   waiting?: boolean;
+  facing?: Facing;
 }
 
 export interface MapSnapshot {
@@ -467,6 +508,7 @@ export function placeSnapshot(db: Db, campaignId: string, placeId: string, scene
       hp: hpState(r.data),
       isTurn: r.id === turnOf,
       ...(waiting.has(r.id) && r.id !== turnOf ? { waiting: true } : {}),
+      ...(p.facing ? { facing: p.facing } : {}),
     })),
     round: typeof data.round === 'number' ? data.round : null,
     turn_of: turnOf ? (entries.find((e) => e.r.id === turnOf)?.r.name ?? null) : null,
@@ -552,21 +594,49 @@ export function asciiMap(db: Db, campaignId: string, placeId: string, actorId: s
     lines.push('Terrain: # wall, + door, % cover, ^ difficult, ~ water, O pit, * object, = stairs, > exit, i item');
   }
   const actor = creatures.find((e) => e.r.id === actorId);
-  const dist = (p: Position) => (actor && p !== actor.p ? `, ${Math.max(Math.abs(p.x - actor.p.x), Math.abs(p.y - actor.p.y)) * map.cell_ft} ft from the actor` : '');
+  // Direction and distance from the actor, so turning and facing need no compass arithmetic.
+  const dist = (r: { x: number; y: number; w: number; h: number }) => {
+    const to = actor ? compassTo(actor.p, r) : null;
+    return to ? `, ${FACING_NAMES[to.facing]} of the actor (${to.facing}), ${to.cells * map.cell_ft} ft` : '';
+  };
+  const cell = (p: Position) => ({ x: p.x, y: p.y, w: p.size ?? 1, h: p.size ?? 1 });
   for (const { r, p } of creatures) {
     const hidden = p.hidden || r.visibility !== 'public' || isConcealed(r.data);
-    lines.push(`${initials.get(r.id)} = ${r.name} (${r.id}) at ${p.x},${p.y}${(p.size ?? 1) > 1 ? ` size ${p.size}` : ''}${hidden ? ' [hidden from players]' : ''}${dist(p)}`);
+    lines.push(`${initials.get(r.id)} = ${r.name} (${r.id}) at ${p.x},${p.y}${(p.size ?? 1) > 1 ? ` size ${p.size}` : ''}${p.facing ? ` facing ${p.facing}` : r.id === actorId ? ' facing not saved yet' : ''}${hidden ? ' [hidden from players]' : ''}${r.id === actorId ? '' : dist(cell(p))}`);
   }
   const unplaced = placedIn(view, placeId).filter((r) => CREATURE_KINDS.has(r.kind) && !posOf(r));
   if (unplaced.length) lines.push(`Not placed yet (give them data.pos when they come into the story): ${unplaced.map((r) => `${r.name} (${r.id})`).join(', ')}`);
-  for (const { r, p } of items) lines.push(`item ${r.name} (${r.id}) at ${p.x},${p.y}${p.hidden ? ' [hidden from players]' : ''}${dist(p)}`);
+  for (const { r, p } of items) lines.push(`item ${r.name} (${r.id}) at ${p.x},${p.y}${p.hidden ? ' [hidden from players]' : ''}${dist(cell(p))}`);
   const ways = new Set(['door', 'exit', 'stairs']);
-  for (const f of [...map.features.map((f) => ({ f, h: false })), ...hiddenFeatures.map((f) => ({ f, h: true }))].filter((x) => x.f.label || x.h || x.f.to || ways.has(x.f.kind))) {
+  for (const f of [...map.features.map((f) => ({ f, h: false })), ...hiddenFeatures.map((f) => ({ f, h: true }))].filter((x) => x.f.label || x.h || x.f.to || x.f.open || ways.has(x.f.kind))) {
     const dest = typeof f.f.to === 'string' ? view.get(f.f.to) : undefined;
     const where = dest ? ` -> leads to ${dest.name} (${dest.id})` : ways.has(f.f.kind) ? ' -> unlinked: set "to" to the location it leads to (create it if new) when it matters' : '';
-    lines.push(`${f.f.kind}${f.f.label ? ` "${f.f.label}"` : ''} at ${f.f.x},${f.f.y} ${f.f.w}x${f.f.h}${where}${f.h ? ' [hidden: gm_notes]' : ''}`);
+    lines.push(`${f.f.kind}${f.f.label ? ` "${f.f.label}"` : ''} at ${f.f.x},${f.f.y} ${f.f.w}x${f.f.h}${where}${f.f.open ? ' [open: can become what the story needs; relabel it and drop open]' : ''}${f.h ? ' [hidden: gm_notes]' : ''}${dist(f.f)}`);
   }
   return lines.join('\n');
+}
+
+/**
+ * What a change does to a map players have already seen: the features they saw that were removed,
+ * moved, resized or relabeled, and a smaller grid. Adding features, linking an exit that led
+ * nowhere, growing the grid and claiming an open feature (a new label) change nothing they saw.
+ */
+export function seenMapChanges(before: SceneMap, after: SceneMap | null): string[] {
+  if (!after) return ['the whole map was removed'];
+  const out: string[] = [];
+  if (after.cols < before.cols || after.rows < before.rows) out.push(`the grid shrank from ${before.cols}x${before.rows} to ${after.cols}x${after.rows}`);
+  const used = new Set<number>();
+  const same = (a: MapFeature, b: MapFeature) => a.kind === b.kind && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
+  const kept = (f: MapFeature) => {
+    const i = after.features.findIndex((g, k) => !used.has(k) && same(f, g) && (f.open || (g.label ?? '') === (f.label ?? '')) && (f.to === undefined || g.to === f.to));
+    if (i >= 0) used.add(i);
+    return i >= 0;
+  };
+  // Exact matches first, so a claimed open feature does not take a twin's place.
+  const missing = before.features.filter((f) => !f.open && !kept(f)).concat(before.features.filter((f) => f.open && !kept(f)));
+  for (const f of missing.slice(0, 6)) out.push(`${f.kind}${f.label ? ` "${f.label}"` : ''} at ${f.x},${f.y}${f.to ? ` (to ${f.to})` : ''}`);
+  if (missing.length > 6) out.push(`and ${missing.length - 6} more features`);
+  return out;
 }
 
 // ---------------------------------------------------------------- SVG / PNG

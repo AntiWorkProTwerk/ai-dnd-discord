@@ -204,7 +204,7 @@ describe('illustrate', () => {
     const runner = runnerWith();
     const t = await playTurn(runner);
     // Every scene has a map now (its battle map, or a sketch), then the picture button.
-    expect(delivery.sent[0]!.buttons?.map((b) => b.customId)).toEqual([`rpg:map:${t.id}:0`, `rpg:img:${t.id}:0`]);
+    expect(delivery.sent[0]!.buttons?.map((b) => b.customId)).toEqual([`rpg:map:${t.id}:0`, `rpg:look:${t.id}:0`, `rpg:img:${t.id}:0`]);
     const r = runner.illustrate(t.id, campaign.id);
     expect(r.message).toMatch(/Painting/);
     expect(await r.done).toMatchObject({ path: expect.stringContaining(`turn-${t.id}.png`) });
@@ -231,7 +231,7 @@ describe('illustrate', () => {
   it('is off without a pipeline and refuses non-scene turns', async () => {
     const off = runnerWith(false);
     const t = await playTurn(off);
-    expect(delivery.sent[0]!.buttons?.map((b) => b.customId)).toEqual([`rpg:map:${t.id}:0`]);
+    expect(delivery.sent[0]!.buttons?.map((b) => b.customId)).toEqual([`rpg:map:${t.id}:0`, `rpg:look:${t.id}:0`]);
     expect(off.illustrate(t.id).message).toMatch(/turned off/);
     const on = runnerWith();
     expect(on.illustrate(99999).message).toMatch(/not a scene/);

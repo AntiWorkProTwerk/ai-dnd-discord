@@ -17,7 +17,8 @@ export type TurnMode =
   | 'setup'
   | 'import'
   | 'lifecycle'
-  | 'summary';
+  | 'summary'
+  | 'prep';
 
 export type TurnStatus =
   | 'queued'

@@ -40,6 +40,7 @@ async function main(): Promise<void> {
     modelLimiter: new Semaphore(config.limits.maxConcurrentModelTurns),
     images: imageConfig.enabled ? { generator: createWorkshopGenerator(imageConfig), queue: gpuQueue, config: imageConfig } : undefined,
     diorama: dioramaConfig.enabled ? { queue: gpuQueue, miniatures: createMiniatureBuilder(dioramaConfig), scene: createSceneRenderer(dioramaConfig) } : undefined,
+    worldPrep: config.worldPrep,
   });
   attachHandlers(client, { db, config, runner });
 

@@ -32,6 +32,12 @@ export function gmPrompt(): { text: string; version: string } {
 
 const MODE_INSTRUCTIONS: Record<string, string> = {
   play: '',
+  prep: `# This request: world preparation (background)
+Nobody is playing this turn. Like a GM between sessions, you get the places around the party ready before they arrive, so the world is consistent and quick when they do. Nothing you write is shown to the players.
+- Do exactly the tasks listed, following "What exists" and "World map": maps sized to the place, exits linked on both sides, people normally there with data.pos, public facts in data, secrets in gm_notes. Leave room for the story on streets and squares: a few unclaimed buildings, doors or side alleys marked "open": true.
+- Stay consistent with everything recorded and with the recent events. Invent only what the tasks need, at the scale of the place (a hamlet has a few households, not a market).
+- Never create or change characters or scenes, never move anyone already placed, and never change what players have already seen (only add to it). No dice.
+- Finish with one save_turn: public_reply is one line for the owner's log saying what you prepared; world_change is null.`,
   ask: `# This request: read-only question
 A player asks a rules or public-world question. You cannot change records or roll dice in this mode. Answer from reference material (search_reference) and from records the player can see (read_records). If the answer is not available to you, say so plainly; never guess hidden facts or reveal secrets. Reply in plain text, under 200 words. Nothing you say here changes the game state.`,
   recap: `# This request: public recap
@@ -145,6 +151,17 @@ function placeSection(db: Db, campaignId: string, view: WorldView, placeId: stri
     });
     out.push(`## Places nearby\n${lines.join('\n')}`);
   }
+  // The outline of the town or region around this place: what exists there and what does not.
+  const areas: string[] = [];
+  const seen = new Set<string>();
+  for (let a: typeof parent = place; a && a.kind === 'location' && !seen.has(a.id) && areas.length < 3; a = a.parent_id ? view.get(a.parent_id) : undefined) {
+    seen.add(a.id);
+    if (a.id === place.id && readMap(a.data.map)) continue; // a mapped place is not an area; everything around it is
+    const notable = Array.isArray(a.data.notable) ? a.data.notable.filter((x): x is string => typeof x === 'string') : [];
+    const secrets = Object.keys(a.gm_notes).length ? `\n  GM notes: ${JSON.stringify(a.gm_notes).slice(0, 600)}` : '';
+    areas.push(notable.length ? `- ${a.name} (${a.id}): ${notable.join('; ')}${secrets}` : `- ${a.name} (${a.id}): no outline yet. Add data.notable (and secrets in gm_notes) the next time you settle what is there.${secrets}`);
+  }
+  if (areas.length) out.push(`## Area outline\nWhat is settled about the area around this place (see What exists).\n${areas.join('\n')}`);
   return out.join('\n\n');
 }
 
@@ -215,8 +232,35 @@ export interface ContextInput {
   ctx: ToolContext;
 }
 
+/** Background preparation: the tasks, the places they are about, and what happened lately. */
+function prepContext({ db, campaign, turn, ctx }: ContextInput): string {
+  let job: { place_id?: string; tasks?: { text?: string }[] } = {};
+  try {
+    job = JSON.parse(turn.input_text) as typeof job;
+  } catch {
+    /* an unreadable job has no tasks */
+  }
+  const tasks = (job.tasks ?? []).map((t) => t.text).filter((t): t is string => typeof t === 'string');
+  const sections = [
+    `## Turn\nmode: prep (background preparation; not shown to players)\ncampaign revision: ${campaign.revision} (use as expected_revision)\ndate: ${nowIso().slice(0, 10)}`,
+    `## Preparation tasks\n${tasks.map((t, i) => `${i + 1}. ${t}`).join('\n') || '(none: save an empty batch)'}`,
+  ];
+  const view = dbView(db, campaign.id);
+  if (job.place_id && view.get(job.place_id)) sections.push(`## Where the party is\n${placeSection(db, campaign.id, view, job.place_id, null)}`);
+  // The records the tasks name, with their versions for the save.
+  const ids = [...new Set(tasks.join(' ').match(/\b[a-z0-9_]{1,16}_[a-km-np-z2-9]{8}\b/g) ?? [])];
+  const named = ids.map((id) => getRecord(db, campaign.id, id)).filter((r): r is RecordRow => !!r);
+  for (const r of named) ctx.seen?.set(r.id, r.version);
+  if (named.length) sections.push(`## Records the tasks are about\n${named.map((r) => clip(J(projectRecord(r, ctx)), 2500)).join('\n')}`);
+  const summary = summaryRecord(db, campaign.id, '_gm_summary');
+  if (summary) sections.push(`## Earlier history (summary)\n${clip(String((JSON.parse(summary.data_json) as { text?: string }).text ?? ''), 2000)}`);
+  sections.push(`## Recent events (oldest first)\n${formatEvents(db, campaign.id, recentTurns(db, campaign.id, 6, 'gm', turn.id, ctx.actorUserId), 'gm')}`);
+  return sections.join('\n\n');
+}
+
 /** Assembles the per-turn user message: actor, scene, party, threads, history and input. */
 export function buildContext({ db, campaign, turn, ctx }: ContextInput): string {
+  if (turn.mode === 'prep') return prepContext({ db, campaign, turn, ctx });
   const view = ctx.view;
   const visible = (r: RecordRow) => view === 'gm' || playerCanSee(r, ctx.actorUserId);
   const sections: string[] = [];

@@ -52,6 +52,13 @@ const EnvSchema = z.object({
   OLLAMA_MODEL: str('qwen3:8b'),
   OLLAMA_NUM_CTX: num(16384, 2048),
 
+  // Background preparation of the places around the party (outlines, maps, exits): on | off.
+  WORLD_PREP: z
+    .string()
+    .optional()
+    .transform((v) => (v ?? 'on').trim().toLowerCase())
+    .pipe(z.enum(['on', 'off', ''])),
+
   MAX_MODEL_CALLS_PER_TURN: num(8, 1),
   MAX_TOOL_CALLS_PER_TURN: num(24, 1),
   MAX_INPUT_TOKENS_PER_CALL: num(32000, 1000),
@@ -99,6 +106,8 @@ export interface AppConfig {
     maxImportBytes: number;
     confirmationTtlMs: number;
   };
+  /** Background preparation of places near the party (WORLD_PREP). */
+  worldPrep: boolean;
   logLevel: string;
 }
 
@@ -148,6 +157,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxImportBytes: Math.round(e.MAX_IMPORT_MB * 1024 * 1024),
       confirmationTtlMs: e.CONFIRMATION_TTL_MINUTES * 60_000,
     },
+    worldPrep: e.WORLD_PREP !== 'off',
     logLevel: e.LOG_LEVEL,
   };
 }

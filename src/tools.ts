@@ -4,7 +4,7 @@
 import { z } from 'zod';
 import { characterNameClash, playerCharacterOwners, getCampaign, getRecord, getTurn, nowIso, parseConfig, type Db } from './database.js';
 import { formatClock, syncWindow, worldClock } from './storylines.js';
-import { CREATURE_KINDS, dbView, placedIn, placeIdOf, posOf, readMap } from './maps.js';
+import { CREATURE_KINDS, dbView, FACING_NAMES, OPPOSITE, placedIn, placeIdOf, posOf, readMap, seenMapChanges, shownFacing } from './maps.js';
 import { rollForTurn, type RollRecord } from './dice.js';
 import { planBatch, worldView, writeBatch, type RawOperation } from './records.js';
 import type { ToolSpec } from './providers.js';
@@ -116,7 +116,7 @@ export const TOOL_SPECS: Record<'read_records' | 'search_reference' | 'roll_dice
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['expected_revision', 'operations', 'public_reply', 'gm_note', 'source_refs', 'roll_ids'],
+      required: ['expected_revision', 'operations', 'public_reply', 'gm_note', 'source_refs', 'roll_ids', 'world_change'],
       properties: {
         expected_revision: { type: 'integer', description: 'Campaign revision you planned against (given in context)' },
         operations: { type: 'array', items: OPERATION_SCHEMA },
@@ -124,6 +124,10 @@ export const TOOL_SPECS: Record<'read_records' | 'search_reference' | 'roll_dice
         gm_note: { type: 'string', description: 'Brief private ruling note for the GM log (not chain-of-thought)' },
         source_refs: { type: 'array', items: { type: 'string' }, description: 'source_id values from search_reference that the ruling relied on' },
         roll_ids: { type: 'array', items: { type: 'string' }, description: 'check_ids used for this outcome' },
+        world_change: nullable('string', {
+          description:
+            'Only when this save changes what players already saw in a place (removes, moves or relabels a feature of its map): what in the world changed it, e.g. "the fire burned the stable down". Null otherwise.',
+        }),
       },
     },
   },
@@ -192,6 +196,7 @@ export const SaveArgs = z.object({
   gm_note: z.string().max(LIMITS.maxGmNoteChars),
   source_refs: z.array(z.string().max(40)).max(20),
   roll_ids: z.array(z.string().max(64)).max(30),
+  world_change: z.string().max(300).nullable().optional(),
 });
 export type SaveTurnArgs = z.infer<typeof SaveArgs>;
 
@@ -535,7 +540,7 @@ function saveTurn(env: ToolEnv, a: SaveTurnArgs): ToolOutcome {
 export function commitTurn(
   db: Db,
   ctx: Pick<ToolContext, 'campaignId' | 'turnId' | 'mode'> & Partial<Pick<ToolContext, 'seen' | 'actorCharacterId'>>,
-  a: Pick<SaveTurnArgs, 'expected_revision' | 'operations' | 'public_reply' | 'gm_note' | 'source_refs' | 'roll_ids'>,
+  a: Pick<SaveTurnArgs, 'expected_revision' | 'operations' | 'public_reply' | 'gm_note' | 'source_refs' | 'roll_ids' | 'world_change'>,
   batchOpts: Parameters<typeof planBatch>[2],
   turnStatusRequired: TurnRow['status'][] = ['running'],
 ): { revision: number; created: Record<string, string> } {
@@ -546,15 +551,17 @@ export function commitTurn(
     const campaign = getCampaign(db, ctx.campaignId);
     if (!campaign) throw new ValidationError('campaign not found');
     if (ctx.mode === 'play' && campaign.status !== 'active') throw new ValidationError(`campaign is ${campaign.status}; play is not open`);
-    // Play turns in different storylines commit concurrently, so they are checked per record
-    // (below) instead of against the campaign-wide revision; other writes keep the strict check.
-    if (ctx.mode !== 'play' && campaign.revision !== a.expected_revision) {
+    // Play turns in different storylines (and background preparation) commit concurrently, so they
+    // are checked per record (below) instead of against the campaign-wide revision; other writes
+    // keep the strict check.
+    const concurrent = ctx.mode === 'play' || ctx.mode === 'prep';
+    if (!concurrent && campaign.revision !== a.expected_revision) {
       throw new ValidationError(
         `stale plan: campaign is at revision ${campaign.revision}, not ${a.expected_revision}. Re-read the records you change and save again, reusing existing check_ids.`,
       );
     }
     const plan = planBatch(db, a.operations as RawOperation[], batchOpts);
-    if (ctx.mode === 'play') {
+    if (concurrent) {
       const stale: string[] = [];
       for (const [id, prior] of plan.before) {
         const seenVersion = prior ? ctx.seen?.get(id) : undefined;
@@ -565,13 +572,19 @@ export function commitTurn(
           `changed in another storyline since you read them: ${stale.join(', ')}. Re-read them with read_records and save again, reusing your existing check_ids.`,
         );
       }
+      checkSeenPlaces(db, campaign.id, plan, ctx.mode === 'prep' ? null : (a.world_change ?? null), ctx.mode === 'prep');
+    }
+    if (ctx.mode === 'prep') checkPrepScope(plan);
+    if (ctx.mode === 'play') {
       checkClockWindow(db, campaign, plan, ctx.actorCharacterId ?? null);
       checkTurnHandback(db, campaign.id, plan, ctx.actorCharacterId ?? null, (JSON.parse(turn.rolls_json) as unknown[]).length > 0);
       checkPlaces(db, campaign.id, plan, ctx.actorCharacterId ?? null);
+      checkFacing(db, campaign.id, plan, ctx.actorCharacterId ?? null, turn.input_text, a.operations as RawOperation[]);
       const usedRolls = new Set(a.roll_ids);
       checkAttackReach(db, campaign.id, plan, (JSON.parse(turn.rolls_json) as RollRecord[]).filter((r) => usedRolls.has(r.check_id)), ctx.actorCharacterId ?? null);
     }
     const applied = writeBatch(db, ctx.campaignId, plan);
+    if (ctx.mode === 'play') markSeenPlaces(db, campaign.id, ctx.turnId);
     const revision = campaign.revision + 1;
     db.prepare('UPDATE campaigns SET revision = ?, updated_at = ? WHERE id = ?').run(revision, nowIso(), ctx.campaignId);
     db.prepare(
@@ -746,6 +759,88 @@ function checkPlaces(db: Db, campaignId: string, plan: ReturnType<typeof planBat
       throw new ValidationError(
         `${missing.map((r) => `${r.name} (${r.id})`).join(', ')} need${missing.length > 1 ? '' : 's'} a position on the map of ${place.name}: set data.pos {x, y} (gm_notes.pos if their whereabouts are secret) in this save, consistent with the narration. Someone who is not really here belongs in another location (parent_id).`,
       );
+    }
+  }
+}
+
+/** "I turn around", "I face the door", "I look out over the water": the player changes which way they face. */
+const TURNS = /\b(turn(s|ed|ing)?\s+(a)?round|turn(s|ed|ing)?\s+(back|to|toward|towards|left|right|away)|(face|faces|faced|facing)\s+(the|toward|towards|north|south|east|west|away|back|him|her|them|it)|look(s|ed|ing)?\s+(out|over|toward|towards|at|back|behind|across|up at|down at))\b/i;
+
+/**
+ * Pictures are drawn from the saved facing, so when the player turns or looks somewhere the save
+ * must say which way the character now faces; otherwise the next picture shows them unturned.
+ */
+function checkFacing(db: Db, campaignId: string, plan: ReturnType<typeof planBatch>, actorCharacterId: string | null, input: string, ops: RawOperation[]): void {
+  if (!actorCharacterId || !TURNS.test(input)) return;
+  const view = worldView(db, campaignId, plan.after);
+  const actor = view.get(actorCharacterId);
+  const place = placeIdOf(view, actorCharacterId);
+  if (!actor || actor.archived || !place || !readMap(view.get(place)?.data.map)) return;
+  const now = posOf(actor);
+  const before = posOf(dbView(db, campaignId).get(actorCharacterId) ?? actor);
+  // Saved this turn: a new facing, or the same one written again (they looked where they already faced).
+  const wrote = ops.some((o) => o.record_id === actorCharacterId && /^data\.pos(\.facing)?$/.test(o.path ?? '') && now?.facing);
+  const shown = shownFacing(dbView(db, campaignId), place, actorCharacterId);
+  // "Turn around" ends up facing the other way from how they were shown, whatever else was saved.
+  if (now?.facing && /\bturn(s|ed|ing)?\s+(a)?round\b/i.test(input) && now.facing === shown) {
+    throw new ValidationError(
+      `${actor.name} was shown facing ${shown} (${FACING_NAMES[shown]}); turning around faces ${OPPOSITE[shown]} (${FACING_NAMES[OPPOSITE[shown]]}). Set data.pos.facing to "${OPPOSITE[shown]}" (or to what they turn to face, if the player named it), and keep the narration to match.`,
+    );
+  }
+  if (!now || now.hidden || wrote || (now.facing && now.facing !== before?.facing)) return;
+  throw new ValidationError(
+    `The player turns or looks somewhere ("${input.slice(0, 80)}"), so set data.pos.facing on ${actor.name} (${actorCharacterId}) to the way they now face: n, ne, e, se, s, sw, w or nw (north is up, smaller y), keeping x and y. ` +
+      `They are shown facing ${shown} (${FACING_NAMES[shown]}${before?.facing ? '' : ', not saved'}); "turn around" is ${OPPOSITE[shown]}. To face something, use its direction from the actor as the Place map lists it (e.g. "north of the actor (n)").`,
+  );
+}
+
+/** Places a player character has been in during a committed play turn. */
+export function isSeenPlace(db: Db, campaignId: string, placeId: string): boolean {
+  return !!db.prepare('SELECT 1 FROM seen_places WHERE campaign_id = ? AND place_id = ?').get(campaignId, placeId);
+}
+
+/** After a play turn: every mapped place a player character is in now has been seen. */
+function markSeenPlaces(db: Db, campaignId: string, turnId: number): void {
+  const view = dbView(db, campaignId);
+  const insert = db.prepare('INSERT OR IGNORE INTO seen_places (campaign_id, place_id, first_turn_id, seen_at) VALUES (?, ?, ?, ?)');
+  for (const id of playerCharacterOwners(db, campaignId).keys()) {
+    const place = placeIdOf(view, id);
+    if (place && readMap(view.get(place)?.data.map)) insert.run(campaignId, place, turnId, nowIso());
+  }
+}
+
+/**
+ * What players have seen is canon: a save may add to a seen place, link its exits and claim its
+ * open features, but removing, moving or relabeling what they saw needs a reason in the world
+ * (world_change). Background preparation never changes it.
+ */
+function checkSeenPlaces(db: Db, campaignId: string, plan: ReturnType<typeof planBatch>, reason: string | null, prep: boolean): void {
+  if (reason?.trim()) return;
+  const before = dbView(db, campaignId);
+  for (const [id, st] of plan.after) {
+    if (st.kind !== 'location' || !plan.before.get(id)) continue;
+    const old = readMap(before.get(id)?.data.map);
+    if (!old || !isSeenPlace(db, campaignId, id)) continue;
+    const changes = seenMapChanges(old, st.archived_at ? null : readMap(st.data.map));
+    if (!changes.length) continue;
+    throw new ValidationError(
+      `Players have already seen ${st.name} (${id}), and this save changes what they saw: ${changes.join('; ')}. ` +
+        (prep
+          ? 'Preparation may only add to a place players have seen (new features, links for exits that led nowhere, claiming open features); keep everything else exactly as it is.'
+          : 'Keep what they saw as it was: add new things only where they have not looked (behind a door, a building they never entered, the next place over), or claim a feature marked open by relabeling it. If something in the world really changed it (a fire, a fight, builders), keep the change and say what in world_change.'),
+    );
+  }
+}
+
+/** Background preparation adds to the world; it never acts for the players or changes what they are in. */
+function checkPrepScope(plan: ReturnType<typeof planBatch>): void {
+  for (const [id, st] of plan.after) {
+    const prior = plan.before.get(id);
+    if (st.kind === 'character' || st.kind === 'scene') {
+      throw new ValidationError(`Preparation cannot ${prior ? 'change' : 'create'} ${st.kind} records (${st.name}). Prepare places, the people who live there and their things only.`);
+    }
+    if (prior && st.kind !== 'location' && posOf({ data: JSON.parse(prior.data_json) as Record<string, unknown>, gm_notes: JSON.parse(prior.gm_notes_json) as Record<string, unknown> })) {
+      throw new ValidationError(`${st.name} (${id}) is already placed in the world; preparation leaves them as they are. Create new people and things instead.`);
     }
   }
 }

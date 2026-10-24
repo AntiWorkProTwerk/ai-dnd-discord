@@ -805,7 +805,11 @@ def place_camera(spec, cam, scene):
         face = focus[0].get('face') if len(focus) == 1 else None
         if face and math.hypot(face['x'] - focus[0]['x'], face['y'] - focus[0]['y']) > 0.1:
             fx, fy = face['x'] - focus[0]['x'], face['y'] - focus[0]['y']
-            a = math.atan2(fy, fx) + math.radians(35)
+            if focus[0].get('faced'):
+                # They turned or looked somewhere on purpose: over the shoulder, toward what they face.
+                a = math.atan2(fy, fx) + math.radians(180 - 35)
+            else:
+                a = math.atan2(fy, fx) + math.radians(35)
             dx, dy = -math.cos(a), -math.sin(a)  # direction camera -> target
         else:
             dx, dy = -1 / math.sqrt(2), -1 / math.sqrt(2)
@@ -1261,7 +1265,7 @@ def backdrop(spec, cam_grid, sight, m):
     the wild) so the world does not end at a flat horizon. Kept out of the camera's way."""
     cols, rows = spec['cols'], spec['rows']
     rnd = random.Random((spec.get('seed') or cols * 7 + rows * 3 + len(spec.get('features') or [])) + 7)
-    town = (spec.get('floor') or 'dirt') in TOWN
+    town = spec['town'] if 'town' in spec else (spec.get('floor') or 'dirt') in TOWN
     cx, cy = cols / 2, rows / 2
     base = math.hypot(cols, rows) / 2 + 1.5
     lit = spec.get('time') in ('dusk', 'night', 'dawn')
@@ -1700,6 +1704,20 @@ def main():
                     box(f['x'] + 0.1, f['y'] + 0.1, f['w'] - 0.2, f['h'] - 0.2, 0.04, m['door'])
                 continue
             build_opening(f, spec, kept_walls, m)
+            continue
+        if shape == 'path':
+            # A way out: a plank walkway flat on the ground, running on past the edge of the map so
+            # it reads as leading somewhere. Flat, so it never hides anyone and every view shows it.
+            x0, y0, w0, h0 = f['x'], f['y'], f['w'], f['h']
+            if f['x'] == 0:
+                x0, w0 = x0 - 2, w0 + 2
+            if f['y'] == 0:
+                y0, h0 = y0 - 2, h0 + 2
+            if f['x'] + f['w'] >= spec['cols']:
+                w0 += 2
+            if f['y'] + f['h'] >= spec['rows']:
+                h0 += 2
+            box(x0 + 0.12, y0 + 0.12, w0 - 0.24, h0 - 0.24, 0.05, m['door'])
             continue
         if blocks_view(rect):
             continue  # cut away: it stands between the camera and the people in focus

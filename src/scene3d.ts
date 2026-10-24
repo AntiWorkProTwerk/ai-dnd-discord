@@ -4,7 +4,7 @@
 // are no AI image artifacts. Never reads gm_notes or hidden records.
 import { getRecord, type Db } from './database.js';
 import { castOf, focusOf, isFight, publicData, sceneFor } from './images.js';
-import { hpState, initialsFor, isConcealed, mapSnapshot, readMap, tokenColor, type MapFeature, type MapSnapshot } from './maps.js';
+import { FACINGS, hpState, initialsFor, isConcealed, mapSnapshot, readMap, tokenColor, type MapFeature, type MapSnapshot } from './maps.js';
 import { timeMin } from './storylines.js';
 import type { RecordRow, TurnRow } from './types.js';
 
@@ -26,6 +26,7 @@ export type Shape =
   | 'stairs'
   | 'tree'
   | 'rock'
+  | 'path'
   | 'block';
 
 export interface SceneFeature {
@@ -54,6 +55,8 @@ export interface ScenePerson {
   waiting?: boolean;
   /** Grid point the person faces. */
   face: { x: number; y: number };
+  /** The facing was saved (they turned or looked somewhere): the shot shows what they face. */
+  faced?: boolean;
 }
 
 export interface SceneSpec {
@@ -69,6 +72,8 @@ export interface SceneSpec {
   /** The camera stands behind and beside `from` and looks at `at` (grid coordinates). */
   camera: { from: { x: number; y: number }; at: { x: number; y: number } };
   fight: boolean;
+  /** In or by a settlement: houses around the map rather than trees and rocks. */
+  town?: boolean;
   /** Seeds the invented set dressing: the same place always gets the same barrels and houses. */
   seed?: number;
 }
@@ -76,6 +81,7 @@ export interface SceneSpec {
 const INDOOR = /\b(inn|tavern|hall|room|cellar|chapel|church|temple|house|home|shop|store|crypt|tomb|dungeon|cave|keep|tower|library|kitchen|barracks|nave|loft|attic|vault|mine|tunnel|interior|inside)\b/i;
 /** Said of the scene itself ("Rain Beyond the Inn", "you look up at the sky"): outdoors, whatever the place is. */
 const OUTSIDE_HINT = /\b(outside|outdoors|open air|beyond|sky|rooftops?|lanes?|streets?)\b/i;
+const TOWN_HINT = /\b(town|towns|village|city|hamlet|market|houses?|stilt|streets?|bridges?|docks?|quay|wharf|boardwalks?|inns?|tavern|square|alley)\b/i;
 const OUTDOOR = /\b(street|road|market|square|field|forest|wood(s|land)?|swamp|marsh|fen|river|lake|shore|beach|dock|pier|harbou?r|camp|courtyard|yard|garden|hill|mountain|plain|meadow|bridge|causeway|outside|outdoors|rooftop|alley)\b/i;
 
 function pickMaterial(text: string, indoor: boolean, surface: 'floor' | 'wall'): Material {
@@ -91,7 +97,11 @@ function pickMaterial(text: string, indoor: boolean, surface: 'floor' | 'wall'):
   if (has(/\b(waist-deep|knee-deep|underwater|flooded (floor|nave|hall|room|cellar|chamber))\b/)) return 'water';
   if (!indoor) {
     if (has(/\b(snow|frost|ice)\b/)) return 'snow';
-    if (has(/\b(cobble|street|square|market|courtyard|alley)/)) return 'cobbles';
+    // Words about the ground itself come before the kind of place ("Market Mound Riverbank": mud, not cobbles).
+    if (has(/\b(mud|muddy|riverbank|bank|marsh|bog|swamp|fen|mire)\b/)) return 'dirt';
+    if (has(/\bcobble/)) return 'cobbles';
+    if (has(/\b(plank|planks|boardwalks?|dock|docks|pier|jetty|wharf|deck)\b/)) return 'wood';
+    if (has(/\b(street|square|market|courtyard|alley)/)) return 'cobbles';
     if (has(/\b(sand|beach|desert|dune)/)) return 'sand';
     if (has(/\b(grass|meadow|field|garden|forest|hill|plain)/)) return 'grass';
     return 'dirt';
@@ -112,7 +122,7 @@ const SHAPES: [RegExp, Shape][] = [
   [/\b(shelf|shelves|cabinet|cupboard|rack|wardrobe|bookcase)\b/i, 'shelf'],
   [/\b(hearth|fireplace|fire|forge|oven|brazier|stove)\b/i, 'hearth'],
   [/\b(window)\b/i, 'window'],
-  [/\b(pillar|column|statue|post|pole|totem)\b/i, 'pillar'],
+  [/\b(pillar|column|statue|post|pole|totem|piling|pile|stake)\b/i, 'pillar'],
   [/\b(cart|wagon|carriage)\b/i, 'cart'],
   [/\b(rock|boulder|stone)\b/i, 'rock'],
 ];
@@ -120,6 +130,8 @@ const SHAPES: [RegExp, Shape][] = [
 function shapeOf(f: MapFeature): Shape {
   if (f.kind === 'door') return 'door';
   if (f.kind === 'stairs') return 'stairs';
+  // A way out is open ground (a path, a gangway, the end of a street), never a solid block.
+  if (f.kind === 'exit') return /\b(stairs?|steps|ladder)\b/i.test(f.label ?? '') ? 'stairs' : 'path';
   // Labels may be plural ("kegs", "tables", "benches"): match each word's singular too.
   const words = (f.label ?? '').replace(/(?<=[a-z])(es|s)\b/gi, '');
   for (const [re, shape] of SHAPES) if (f.label && (re.test(f.label) || re.test(words))) return shape;
@@ -173,7 +185,13 @@ function setting(db: Db, turn: SceneMoment) {
       scene_name: (publicData(story) ? story?.name : null) ?? place?.name ?? 'The scene',
       sketch: true,
     };
-  return { actor, story, cast, real, snap, placeText, indoor };
+  // Houses or wilderness around the map: the place or the area it is in says so ("stilt houses", a town).
+  const around: string[] = [placeText];
+  for (let a = place?.parent_id ? getRecord(db, turn.campaign_id, place.parent_id) : undefined, n = 0; a && n < 3; a = a.parent_id ? getRecord(db, turn.campaign_id, a.parent_id) : undefined, n++) {
+    if (a.kind === 'location' && publicData(a)) around.push(a.name, String(publicData(a)?.description ?? ''));
+  }
+  const town = TOWN_HINT.test(around.join(' '));
+  return { actor, story, cast, real, snap, placeText, indoor, town };
 }
 
 /**
@@ -190,7 +208,7 @@ export function layoutFor(db: Db, turn: SceneMoment): MapSnapshot {
  * Everyone on the map is a person in the spec; `focus` marks who the shot is about.
  */
 export function buildSceneSpec(db: Db, turn: SceneMoment, modelOf: (recordId: string) => string | null = () => null): SceneSpec {
-  const { actor, story, cast, real, snap, placeText, indoor } = setting(db, turn);
+  const { actor, story, cast, real, snap, placeText, indoor, town } = setting(db, turn);
   const focus = focusOf(cast, actor, story, real?.sketch ? null : real, turn.public_reply ?? '');
   const storyData = publicData(story) ?? {};
   const weatherText = `${placeText} ${String(storyData.time ?? '')} ${turn.public_reply ?? ''}`;
@@ -224,6 +242,13 @@ export function buildSceneSpec(db: Db, turn: SceneMoment, modelOf: (recordId: st
     const near = others.sort((a, b) => Math.hypot(a.x - p.x, a.y - p.y) - Math.hypot(b.x - p.x, b.y - p.y))[0];
     const target = p === me || !me ? near : fight ? near : me;
     p.face = target ? { x: target.x, y: target.y } : { x: p.x, y: p.y + 1 };
+    // A saved facing wins outside fights (in a fight everyone squares up to an opponent).
+    const facing = snap.tokens.find((t) => t.id === p.id)?.facing;
+    if (facing && !fight) {
+      const [dx, dy] = FACINGS[facing];
+      p.face = { x: p.x + dx, y: p.y + dy };
+      p.faced = true;
+    }
   }
 
   const focusPeople = people.filter((p) => p.focus);
@@ -233,6 +258,7 @@ export function buildSceneSpec(db: Db, turn: SceneMoment, modelOf: (recordId: st
 
   return {
     indoor,
+    town,
     floor: pickMaterial(placeText, indoor, 'floor'),
     wall: pickMaterial(placeText, indoor, 'wall'),
     time: timeOfDay(story ? timeMin(story) : null, `${String(storyData.time ?? '')} ${placeText}`),
